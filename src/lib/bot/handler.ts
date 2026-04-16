@@ -244,10 +244,14 @@ function mineWithoutMapMessage(
   telegramUserId: number,
   notionTeamDir: boolean,
 ): string {
+  const tgCol =
+    process.env.NOTION_TEAM_LINK_TELEGRAM_PROP?.trim() || "Telegram user id";
+  const assigneeCol =
+    process.env.NOTION_TEAM_LINK_ASSIGNEE_PROP?.trim() || "Notion assignee";
   const notionLine = notionTeamDir
-    ? "\n\nAsk an admin to add your Telegram user id and your Notion assignee name as a row in the <b>team link</b> database."
+    ? `\n\n<b>Team link database is configured</b>, but no row matches your Telegram id <code>${telegramUserId}</code>.\n\n<b>Checklist</b>\n• Row exists with <code>${tgCol}</code> = <code>${telegramUserId}</code> (digits only)\n• <code>${assigneeCol}</code> <i>or the page title</i> = exact Production <b>Assignee</b> text (e.g. from your export)\n• Property names in Notion match the defaults above, or set <code>NOTION_TEAM_LINK_TELEGRAM_PROP</code> / <code>NOTION_TEAM_LINK_ASSIGNEE_PROP</code> in Vercel to your real column names\n• Integration is connected to the team link database\n• Redeploy after env changes; wait ~1 min (cache) or send another message`
     : "";
-  return `<b>My queue</b> needs an assignee link.${notionLine}\n\nAdd this to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> on the server (JSON):\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>\n\nUse the exact name shown in the Notion <b>Assignee</b> column.`;
+  return `<b>My queue</b> needs an assignee link.${notionLine}\n\n<b>Or</b> add to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel (JSON):\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>\n\nUse the exact name shown in the Production <b>Assignee</b> column.`;
 }
 
 function helpMessage(

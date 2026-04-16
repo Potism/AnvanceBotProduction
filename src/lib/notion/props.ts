@@ -70,3 +70,14 @@ export function pageTitle(page: PageObjectResponse, nameProp: string): string {
   if (p?.type === "title") return plainFromRichText(p.title) || "Untitled";
   return "Untitled";
 }
+
+/** First non-empty title property on the page (any column name). */
+export function firstTitleOnPage(page: PageObjectResponse): string {
+  for (const p of Object.values(page.properties)) {
+    if (p?.type === "title") {
+      const t = plainFromRichText(p.title).trim();
+      if (t) return t;
+    }
+  }
+  return "";
+}

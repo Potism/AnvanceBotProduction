@@ -1,7 +1,7 @@
 import { Client } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 import type { BotConfig } from "../types";
-import { propertyAsString } from "./props";
+import { firstTitleOnPage, propertyAsString } from "./props";
 
 const TTL_MS = 60_000;
 
@@ -65,12 +65,19 @@ async function fetchAssigneeLinksFromNotion(
       if (!("properties" in r)) continue;
       const page = r as PageObjectResponse;
       const rawTg = propertyAsString(page, tgProp).replace(/\s/g, "");
-      const assignee = propertyAsString(page, assigneeProp).trim();
+      let assignee = propertyAsString(page, assigneeProp).trim();
+      if (!assignee) assignee = firstTitleOnPage(page).trim();
       if (!/^\d+$/.test(rawTg) || !assignee) continue;
       out[rawTg] = assignee;
     }
     cursor = res.has_more ? res.next_cursor ?? undefined : undefined;
   } while (cursor);
+
+  if (Object.keys(out).length > 0) {
+    console.info(
+      `[assignee-map] Loaded ${Object.keys(out).length} row(s) from team link database`,
+    );
+  }
 
   return out;
 }
