@@ -58,7 +58,29 @@ function viewTitle(view: TaskView): string {
 }
 
 export async function handleTelegramUpdate(update: unknown): Promise<void> {
-  if (!isBotConfigured()) return;
+  const cfgEarly = getBotConfig();
+  if (!isBotConfigured()) {
+    const token = cfgEarly.telegramBotToken;
+    const u0 = update as {
+      message?: { chat: { id: number } };
+      callback_query?: { message?: { chat: { id: number } } };
+    };
+    const chatId =
+      u0.message?.chat?.id ?? u0.callback_query?.message?.chat?.id;
+    if (token && chatId) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        "<b>Server not fully configured</b>\nSet <code>NOTION_TOKEN</code>, <code>NOTION_DATABASE_ID</code>, and <code>TELEGRAM_BOT_TOKEN</code> on Vercel (Production), then redeploy.",
+        undefined,
+      ).catch(() => {});
+    } else {
+      console.warn(
+        "[telegram] Skipping update: missing NOTION_TOKEN, NOTION_DATABASE_ID, and/or TELEGRAM_BOT_TOKEN on server",
+      );
+    }
+    return;
+  }
 
   const cfg = getBotConfig();
   const token = cfg.telegramBotToken;
