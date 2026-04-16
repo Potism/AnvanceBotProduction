@@ -10,7 +10,11 @@ const envRows = [
   ["TELEGRAM_BOT_TOKEN", "From BotFather"],
   ["NEXT_PUBLIC_APP_URL", "Public site URL for webhooks"],
   ["TELEGRAM_WEBHOOK_SECRET", "Optional; must match Telegram secret header"],
-  ["TELEGRAM_USER_ASSIGNEE_MAP", "JSON map of Telegram user id → Notion assignee name"],
+  ["TELEGRAM_USER_ASSIGNEE_MAP", "Small teams: JSON Telegram id → Notion assignee name"],
+  [
+    "NOTION_TEAM_LINK_DATABASE_ID",
+    "Optional; Notion DB id — one row per person (Telegram id + assignee name); scales for large teams",
+  ],
   ["ADMIN_SETUP_SECRET", "Protects the set-webhook helper route"],
 ];
 

@@ -1,4 +1,5 @@
 import { getBotConfig, isBotConfigured } from "../config";
+import { resolveTelegramAssigneeMap } from "../notion/assignee-map";
 import { fetchProductionTasks, type TaskView } from "../notion/tasks";
 import {
   answerCallbackQuery,
@@ -83,7 +84,11 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   }
 
   const cfg = getBotConfig();
+  const assigneeMap = await resolveTelegramAssigneeMap(cfg);
   const token = cfg.telegramBotToken;
+  const notionTeamDir = Boolean(
+    process.env.NOTION_TEAM_LINK_DATABASE_ID?.trim(),
+  );
 
   const u = update as {
     message?: { chat: { id: number }; text?: string; from?: TelegramUser };
@@ -105,7 +110,7 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
       await sendMessageHtml(
         token,
         chatId,
-        helpMessage(fromId, cfg.telegramUserAssignees),
+        helpMessage(fromId, assigneeMap),
         mainMenuKeyboard(),
       );
       return;
@@ -115,12 +120,12 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
       const view = data.slice(2) as TaskView;
       if (!["today", "week", "mine", "board"].includes(view)) return;
       await answerCallbackQuery(token, u.callback_query.id, "Pulling Notion…");
-      const needle = resolveAssigneeNeedle(fromId, cfg.telegramUserAssignees);
+      const needle = resolveAssigneeNeedle(fromId, assigneeMap);
       if (view === "mine" && !needle) {
         await sendMessageHtml(
           token,
           chatId,
-          mineWithoutMapMessage(fromId),
+          mineWithoutMapMessage(fromId, notionTeamDir),
           mainMenuKeyboard(),
         );
         return;
@@ -156,7 +161,7 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     await sendMessageHtml(
       token,
       chatId,
-      welcomeMessage(fromId, cfg.telegramUserAssignees),
+      welcomeMessage(fromId, assigneeMap, notionTeamDir),
       mainMenuKeyboard(),
     );
     return;
@@ -166,7 +171,7 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     await sendMessageHtml(
       token,
       chatId,
-      helpMessage(fromId, cfg.telegramUserAssignees),
+      helpMessage(fromId, assigneeMap),
       mainMenuKeyboard(),
     );
     return;
@@ -186,12 +191,12 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   const nlView = cmdView ?? detectViewFromText(text);
 
   if (nlView) {
-    const needle = resolveAssigneeNeedle(fromId, cfg.telegramUserAssignees);
+    const needle = resolveAssigneeNeedle(fromId, assigneeMap);
     if (nlView === "mine" && !needle) {
       await sendMessageHtml(
         token,
         chatId,
-        mineWithoutMapMessage(fromId),
+        mineWithoutMapMessage(fromId, notionTeamDir),
         mainMenuKeyboard(),
       );
       return;
@@ -224,16 +229,25 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
 function welcomeMessage(
   telegramUserId: number,
   map: Record<string, string>,
+  notionTeamDir: boolean,
 ): string {
   const linked = Boolean(map[String(telegramUserId)]);
   const linkHint = linked
     ? "You are linked to a Notion assignee name."
-    : `<b>Heads up:</b> add your Telegram user id to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> so “My queue” filters to you.`;
+    : notionTeamDir
+      ? `<b>Heads up:</b> add a row in your Notion <b>team link</b> database (Telegram id → assignee name), or use <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel for overrides.`
+      : `<b>Heads up:</b> add your Telegram user id to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> or configure <code>NOTION_TEAM_LINK_DATABASE_ID</code> (see <code>.env.example</code>) so “My queue” filters to you.`;
   return `<b>Anvance Production</b> · Ops copilot\n\n${linkHint}\n\nTap a view or ask in plain language.`;
 }
 
-function mineWithoutMapMessage(telegramUserId: number): string {
-  return `<b>My queue</b> needs an assignee link.\n\nAdd this to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> on the server (JSON):\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>\n\nUse the exact name shown in the Notion <b>Assignee</b> column.`;
+function mineWithoutMapMessage(
+  telegramUserId: number,
+  notionTeamDir: boolean,
+): string {
+  const notionLine = notionTeamDir
+    ? "\n\nAsk an admin to add your Telegram user id and your Notion assignee name as a row in the <b>team link</b> database."
+    : "";
+  return `<b>My queue</b> needs an assignee link.${notionLine}\n\nAdd this to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> on the server (JSON):\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>\n\nUse the exact name shown in the Notion <b>Assignee</b> column.`;
 }
 
 function helpMessage(
@@ -243,7 +257,7 @@ function helpMessage(
   const idLine = `Your Telegram user id: <code>${telegramUserId}</code>`;
   const mapLine =
     Object.keys(map).length === 0
-      ? "No assignee map configured yet."
-      : "Assignee map is configured on the server.";
+      ? "No assignee links loaded (Notion team DB + env map empty)."
+      : `Assignee links loaded (${Object.keys(map).length} entries).`;
   return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n/start — menu\n/help — this message\n/today /week /mine /board\n\n<b>Natural language</b>\n“what are my tasks today”, “this week”, “team board”`;
 }
