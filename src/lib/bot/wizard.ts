@@ -290,12 +290,6 @@ function calendarKeyboard(field: "d" | "s", year: number, month0: number): Reply
   return { inline_keyboard: rows };
 }
 
-function stepNeedsCalendar(step: Step): "d" | "s" | null {
-  if (step === "due") return "d";
-  if (step === "shoot") return "s";
-  return null;
-}
-
 function keyboardFor(session: Session): ReplyMarkup {
   switch (session.step) {
     case "title":

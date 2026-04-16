@@ -230,9 +230,10 @@ export default function Home() {
             <p className="mt-2 text-xs leading-relaxed text-zinc-500">
               <b>AI (optional).</b> Set <code>OPENAI_API_KEY</code> and the bot
               accepts <b>voice notes</b> (transcribed via Whisper) and{" "}
-              <b>natural-language</b> messages — "reel for APX due Friday P1"
-              creates a structured task; "what's overdue?" routes to{" "}
-              <code>/overdue</code>; "find Hotel" runs <code>/find</code>.
+              <b>natural-language</b> messages — &ldquo;reel for APX due Friday
+              P1&rdquo; creates a structured task; &ldquo;what&rsquo;s
+              overdue?&rdquo; routes to <code>/overdue</code>; &ldquo;find
+              Hotel&rdquo; runs <code>/find</code>.
             </p>
           </div>
 
