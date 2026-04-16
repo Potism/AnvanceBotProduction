@@ -74,6 +74,7 @@ export function mainMenuKeyboard(): ReplyMarkup {
         { text: "My queue", callback_data: "v:mine" },
         { text: "Team board", callback_data: "v:board" },
       ],
+      [{ text: "Link account", callback_data: "a:link" }],
       [{ text: "Help", callback_data: "v:help" }],
     ],
   };

@@ -1,5 +1,10 @@
 import { getBotConfig, isBotConfigured } from "../config";
 import { resolveTelegramAssigneeMap } from "../notion/assignee-map";
+import {
+  listDistinctAssigneesFromProduction,
+  matchAssigneeInput,
+} from "../notion/production-assignees";
+import { upsertTeamTelegramLink } from "../notion/team-link-upsert";
 import { fetchProductionTasks, type TaskView } from "../notion/tasks";
 import {
   answerCallbackQuery,
@@ -11,6 +16,8 @@ import {
   headerLine,
   splitTelegramHtml,
 } from "../telegram/format";
+import type { AssigneeMatchResult } from "../notion/production-assignees";
+import type { BotConfig } from "../types";
 
 type TelegramUser = { id: number; first_name?: string; username?: string };
 
@@ -116,6 +123,17 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
       return;
     }
 
+    if (data === "a:link") {
+      await answerCallbackQuery(token, u.callback_query.id);
+      await sendMessageHtml(
+        token,
+        chatId,
+        linkInstructionsHtml(),
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+
     if (data.startsWith("v:")) {
       const view = data.slice(2) as TaskView;
       if (!["today", "week", "mine", "board"].includes(view)) return;
@@ -177,6 +195,20 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     return;
   }
 
+  const linkMatch = text.match(/^\/link(?:@\S*)?(?:\s+([\s\S]*))?$/i);
+  if (linkMatch) {
+    const nameArg = (linkMatch[1] ?? "").trim();
+    await handleLinkCommand(
+      cfg,
+      token,
+      chatId,
+      fromId,
+      nameArg,
+      notionTeamDir,
+    );
+    return;
+  }
+
   const cmdView =
     text.startsWith("/today")
       ? ("today" as const)
@@ -221,7 +253,7 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   await sendMessageHtml(
     token,
     chatId,
-    `Try: <b>What are my tasks today?</b>\nOr tap a button below.`,
+    `Try <i>tasks due today</i> or tap a view below.\nNeed <b>My queue</b>? Use <code>/link</code> or <b>Link account</b>.`,
     mainMenuKeyboard(),
   );
 }
@@ -233,11 +265,11 @@ function welcomeMessage(
 ): string {
   const linked = Boolean(map[String(telegramUserId)]);
   const linkHint = linked
-    ? "You are linked to a Notion assignee name."
+    ? "You are set up for <b>My queue</b>."
     : notionTeamDir
-      ? `<b>Heads up:</b> add a row in your Notion <b>team link</b> database (Telegram id → assignee name), or use <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel for overrides.`
-      : `<b>Heads up:</b> add your Telegram user id to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> or configure <code>NOTION_TEAM_LINK_DATABASE_ID</code> (see <code>.env.example</code>) so “My queue” filters to you.`;
-  return `<b>Anvance Production</b> · Ops copilot\n\n${linkHint}\n\nTap a view or ask in plain language.`;
+      ? `Tap <b>Link account</b> or send <code>/link Your Notion name</code> (same spelling as <b>Assignee</b> in Production).`
+      : `For <b>My queue</b>, ops can enable the team link database or add you via <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel.`;
+  return `<b>Anvance Production</b>\n<i>Notion task desk</i>\n\n${linkHint}\n\nUse the keyboard or type naturally — e.g. <i>tasks due today</i>.`;
 }
 
 function mineWithoutMapMessage(
@@ -249,9 +281,9 @@ function mineWithoutMapMessage(
   const assigneeCol =
     process.env.NOTION_TEAM_LINK_ASSIGNEE_PROP?.trim() || "Notion assignee";
   const notionLine = notionTeamDir
-    ? `\n\n<b>Team link database is configured</b>, but no row matches your Telegram id <code>${telegramUserId}</code>.\n\n<b>Checklist</b>\n• Row exists with <code>${tgCol}</code> = <code>${telegramUserId}</code> (digits only)\n• <code>${assigneeCol}</code> <i>or the page title</i> = exact Production <b>Assignee</b> text (e.g. from your export)\n• Property names in Notion match the defaults above, or set <code>NOTION_TEAM_LINK_TELEGRAM_PROP</code> / <code>NOTION_TEAM_LINK_ASSIGNEE_PROP</code> in Vercel to your real column names\n• Integration is connected to the team link database\n• Redeploy after env changes; wait ~1 min (cache) or send another message`
+    ? `\n\n<b>Self-service:</b> <code>/link Your full Notion assignee name</code> (same as Production).\n\n<b>Or</b> ask ops to add a row: <code>${tgCol}</code> = <code>${telegramUserId}</code>, <code>${assigneeCol}</code> or page title = assignee name. Wait ~1 min after changes (cache).`
     : "";
-  return `<b>My queue</b> needs an assignee link.${notionLine}\n\n<b>Or</b> add to <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel (JSON):\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>\n\nUse the exact name shown in the Production <b>Assignee</b> column.`;
+  return `<b>My queue</b> needs an assignee link.${notionLine}\n\n<b>Ops-only fallback</b> — <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel:\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>`;
 }
 
 function helpMessage(
@@ -261,7 +293,149 @@ function helpMessage(
   const idLine = `Your Telegram user id: <code>${telegramUserId}</code>`;
   const mapLine =
     Object.keys(map).length === 0
-      ? "No assignee links loaded (Notion team DB + env map empty)."
-      : `Assignee links loaded (${Object.keys(map).length} entries).`;
-  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n/start — menu\n/help — this message\n/today /week /mine /board\n\n<b>Natural language</b>\n“what are my tasks today”, “this week”, “team board”`;
+      ? "No assignee links loaded yet."
+      : `Assignee links on file: <b>${Object.keys(map).length}</b>`;
+  return `${idLine}\n${mapLine}\n\n<b>Shortcuts</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/board</code>\n<code>/link</code> — connect Telegram ↔ Notion assignee\n<code>/start</code> · <code>/help</code>\n\n<b>Natural language</b>\n<i>What are my tasks today?</i> · <i>this week</i> · <i>team board</i>`;
+}
+
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function linkInstructionsHtml(): string {
+  return `<b>Link your Telegram account</b>
+
+So <b>My queue</b> can show <i>your</i> Production tasks, send your name exactly as it appears in the <b>Assignee</b> column:
+
+<code>/link Your full name</code>
+
+<b>Example</b>
+<code>/link Albert Rhey Embalsado</code>
+
+We match against assignee names currently on tasks in Production. If several people match, use a fuller name.`;
+}
+
+function linkDisabledNoDbHtml(): string {
+  return `<b>Self-service link is off</b>
+
+Ask ops to set <code>NOTION_TEAM_LINK_DATABASE_ID</code> in Vercel (team directory database shared with the integration), redeploy, then try <code>/link</code> again.`;
+}
+
+function linkNoAssigneesInProductionHtml(): string {
+  return `<b>No assignee names found</b> on open tasks in Production.
+
+Add at least one task with an <b>Assignee</b>, then try <code>/link</code> again.`;
+}
+
+function linkMatchFailedHtml(raw: string, match: AssigneeMatchResult): string {
+  if (!match.ok && match.reason === "empty") return linkInstructionsHtml();
+  const name = esc(raw);
+  if (!match.ok && match.reason === "ambiguous") {
+    const lines = match.suggestions
+      .map((s) => `• <code>${esc(s)}</code>`)
+      .join("\n");
+    return `<b>Several assignees matched</b> “${name}”.
+
+Send a fuller name, e.g.:
+<code>/link ${esc(match.suggestions[0])}</code>
+
+<b>Possible matches</b>
+${lines}`;
+  }
+  if (!match.ok && match.reason === "none") {
+    const sample = match.suggestions.slice(0, 10);
+    const lines = sample.map((s) => `• <code>${esc(s)}</code>`).join("\n");
+    return `<b>No assignee matched</b> “${name}”.
+
+Use the exact text from Production <b>Assignee</b>. Examples on file:
+${lines}`;
+  }
+  return linkInstructionsHtml();
+}
+
+function linkSuccessHtml(assignee: string, mode: "exact" | "unique_partial"): string {
+  const note =
+    mode === "unique_partial"
+      ? "\n<i>Matched from a partial name — you can re-link with the full name anytime.</i>"
+      : "";
+  return `<b>Linked</b>
+
+Your Telegram is mapped to:
+<code>${esc(assignee)}</code>
+
+Open <b>My queue</b> when you are ready.${note}`;
+}
+
+function linkErrorHtml(message: string): string {
+  return `<b>Could not save link</b>\n\n<code>${esc(message)}</code>\n\nIf the team link database has extra <i>required</i> columns, add defaults or make them optional in Notion.`;
+}
+
+async function handleLinkCommand(
+  cfg: BotConfig,
+  token: string,
+  chatId: number,
+  fromId: number,
+  nameArg: string,
+  notionTeamDir: boolean,
+): Promise<void> {
+  if (!notionTeamDir) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      linkDisabledNoDbHtml(),
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+  if (!nameArg) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      linkInstructionsHtml(),
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+  try {
+    const candidates = await listDistinctAssigneesFromProduction(cfg);
+    if (candidates.length === 0) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        linkNoAssigneesInProductionHtml(),
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+    const match = matchAssigneeInput(nameArg, candidates);
+    if (!match.ok) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        linkMatchFailedHtml(nameArg, match),
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+    await upsertTeamTelegramLink(cfg, fromId, match.assignee);
+    await sendMessageHtml(
+      token,
+      chatId,
+      linkSuccessHtml(match.assignee, match.mode),
+      mainMenuKeyboard(),
+    );
+  } catch (e) {
+    const msg =
+      e instanceof Error ? e.message : "Unknown error while saving link.";
+    console.error("[link]", e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      linkErrorHtml(msg),
+      mainMenuKeyboard(),
+    );
+  }
 }

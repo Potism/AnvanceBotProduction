@@ -8,6 +8,10 @@ const TTL_MS = 60_000;
 type CacheEntry = { at: number; map: Record<string, string>; key: string };
 let cache: CacheEntry | null = null;
 
+export function clearAssigneeMapCache(): void {
+  cache = null;
+}
+
 function cacheKey(cfg: BotConfig): string {
   const db = process.env.NOTION_TEAM_LINK_DATABASE_ID?.trim() ?? "";
   const envRaw = process.env.TELEGRAM_USER_ASSIGNEE_MAP ?? "";

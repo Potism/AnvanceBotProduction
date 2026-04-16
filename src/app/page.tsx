@@ -91,6 +91,18 @@ export default function Home() {
                   Call the protected set-webhook route once your app is public.
                 </span>
               </li>
+              <li className="flex gap-3">
+                <span className="mt-0.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15 text-xs font-semibold text-emerald-200 ring-1 ring-emerald-400/30">
+                  4
+                </span>
+                <span>
+                  Optional team scale: set{" "}
+                  <code className="text-[11px]">NOTION_TEAM_LINK_DATABASE_ID</code>{" "}
+                  for a small Notion directory DB; teammates run{" "}
+                  <code className="text-[11px]">/link</code> in Telegram (no env
+                  JSON per person).
+                </span>
+              </li>
             </ul>
           </div>
 
@@ -149,22 +161,26 @@ export default function Home() {
           <div className="rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-6">
             <h2 className="text-sm font-semibold text-white">Telegram UX</h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-400">
-              Inline keyboards for Today, This week, My queue, and Team board.
-              Natural prompts like{" "}
+              Inline keyboards for Today, This week, My queue, and Team board,
+              plus <b>Link account</b> /{" "}
+              <code className="text-[11px] text-zinc-200">/link</code> for
+              self-service My queue setup. Natural prompts like{" "}
               <span className="text-zinc-200">
                 “what are my tasks today”
               </span>{" "}
               route to the same engine as slash commands.
             </p>
             <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              {["/today", "/week", "/mine", "/board", "/help"].map((cmd) => (
-                <div
-                  key={cmd}
-                  className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-zinc-200"
-                >
-                  {cmd}
-                </div>
-              ))}
+              {["/today", "/week", "/mine", "/board", "/link", "/help"].map(
+                (cmd) => (
+                  <div
+                    key={cmd}
+                    className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-zinc-200"
+                  >
+                    {cmd}
+                  </div>
+                ),
+              )}
             </div>
           </div>
 
