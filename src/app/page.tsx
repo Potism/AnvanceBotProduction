@@ -36,6 +36,14 @@ const envRows = [
     "TELEGRAM_DIGEST_TZ / _HOUR",
     "Digest localtime gate (default Europe/Rome 08:00, DST-safe)",
   ],
+  [
+    "OPENAI_API_KEY",
+    "Enables voice-to-task, natural-language /new, and AI intent router",
+  ],
+  [
+    "OPENAI_MODEL / OPENAI_AUDIO_MODEL",
+    "Defaults: gpt-5.4 and whisper-1 — override per preference",
+  ],
 ];
 
 export default function Home() {
@@ -218,6 +226,13 @@ export default function Home() {
               Morning digest DMs every linked teammate at <b>08:00 Europe/Rome</b>{" "}
               (auto-adjusts for CET/CEST). Notion webhooks DM the assignee on
               new tasks and hot status changes.
+            </p>
+            <p className="mt-2 text-xs leading-relaxed text-zinc-500">
+              <b>AI (optional).</b> Set <code>OPENAI_API_KEY</code> and the bot
+              accepts <b>voice notes</b> (transcribed via Whisper) and{" "}
+              <b>natural-language</b> messages — "reel for APX due Friday P1"
+              creates a structured task; "what's overdue?" routes to{" "}
+              <code>/overdue</code>; "find Hotel" runs <code>/find</code>.
             </p>
           </div>
 

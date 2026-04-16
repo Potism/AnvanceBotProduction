@@ -10,9 +10,19 @@ import {
 } from "../notion/actions";
 import { parseNewTaskArgs } from "./new-task-parse";
 import {
+  aiEnabled,
+  extractNewTask,
+  routeIntent,
+  transcribeAudio,
+  type ExtractedTask,
+  type ExtractionContext,
+} from "../ai/openai";
+import { downloadTelegramFile } from "../ai/telegram-voice";
+import {
   loadAssigneeLinkCatalog,
   matchAssigneeInput,
 } from "../notion/production-assignees";
+import { fetchStatusOptionNames } from "../notion/actions";
 import {
   fetchProductionTasks,
   fetchTaskById,
@@ -180,7 +190,15 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   );
 
   const u = update as {
-    message?: { chat: { id: number }; text?: string; from?: TelegramUser };
+    message?: {
+      chat: { id: number };
+      text?: string;
+      caption?: string;
+      from?: TelegramUser;
+      voice?: { file_id: string; duration?: number };
+      audio?: { file_id: string; duration?: number };
+      video_note?: { file_id: string; duration?: number };
+    };
     callback_query?: {
       id: string;
       from: TelegramUser;
@@ -256,9 +274,20 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
 
   const chatId = msg.chat.id;
   const fromId = msg.from?.id;
-  const text = (msg.text ?? "").trim();
+  let text = (msg.text ?? msg.caption ?? "").trim();
 
   if (!fromId) return;
+
+  const voiceFile =
+    msg.voice?.file_id ??
+    msg.audio?.file_id ??
+    msg.video_note?.file_id ??
+    null;
+  if (voiceFile) {
+    const spoken = await handleVoiceMessage(token, chatId, voiceFile);
+    if (!spoken) return;
+    text = spoken;
+  }
 
   if (text.startsWith("/start")) {
     await sendMessageHtml(
@@ -326,12 +355,101 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     return;
   }
 
+  if (aiEnabled() && text) {
+    try {
+      const intent = await routeIntent(text);
+      if (intent.kind === "view") {
+        const needle = assigneeMap[String(fromId)];
+        await sendView(cfg, chatId, intent.view, fromId, needle);
+        return;
+      }
+      if (intent.kind === "find") {
+        await handleFindCommand(cfg, chatId, intent.query);
+        return;
+      }
+      if (intent.kind === "create") {
+        await handleNewCommand(cfg, chatId, fromId, intent.transcriptForExtractor);
+        return;
+      }
+      if (intent.kind === "reviews" || intent.kind === "shoots") {
+        await sendMessageHtml(
+          token,
+          chatId,
+          `<i>${intent.kind === "reviews" ? "Reviews" : "Shoots"} view is coming next. For now try <code>/mine</code> or <code>/week</code>.</i>`,
+          mainMenuKeyboard(),
+        );
+        return;
+      }
+      if (intent.kind === "help") {
+        await sendMessageHtml(
+          token,
+          chatId,
+          helpMessage(fromId, assigneeMap),
+          mainMenuKeyboard(),
+        );
+        return;
+      }
+      if (intent.kind === "smalltalk") {
+        await sendMessageHtml(
+          token,
+          chatId,
+          esc(intent.reply),
+          mainMenuKeyboard(),
+        );
+        return;
+      }
+    } catch (e) {
+      console.warn("[ai router]", (e as Error).message);
+    }
+  }
+
   await sendMessageHtml(
     token,
     chatId,
-    `Try <i>tasks due today</i> or tap a view below.\nSearch: <code>/find hotel</code>. Onboard: <code>/link</code>.`,
+    `Try <i>tasks due today</i> or tap a view below.\nSearch: <code>/find hotel</code>. Onboard: <code>/link</code>.` +
+      (aiEnabled() ? "" : `\n\n<i>Tip: set <code>OPENAI_API_KEY</code> to unlock voice and natural-language commands.</i>`),
     mainMenuKeyboard(),
   );
+}
+
+async function handleVoiceMessage(
+  token: string,
+  chatId: number,
+  fileId: string,
+): Promise<string | null> {
+  if (!aiEnabled()) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Voice needs AI</b>\n\nSet <code>OPENAI_API_KEY</code> in Vercel (and optionally <code>OPENAI_MODEL</code> / <code>OPENAI_AUDIO_MODEL</code>) to enable voice-to-task.`,
+      mainMenuKeyboard(),
+    );
+    return null;
+  }
+
+  try {
+    const { buffer, filename } = await downloadTelegramFile(token, fileId);
+    const transcript = await transcribeAudio(buffer, filename);
+    if (!transcript) {
+      await sendMessageHtml(token, chatId, "<i>Could not transcribe. Try again?</i>");
+      return null;
+    }
+    await sendMessageHtml(
+      token,
+      chatId,
+      `🎙 <i>${esc(transcript)}</i>`,
+    );
+    return transcript;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[voice]", e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Voice transcription failed</b>\n<code>${esc(msg)}</code>`,
+    );
+    return null;
+  }
 }
 
 async function handleTaskActionCallback(
@@ -423,7 +541,15 @@ async function handleNewCommand(
       chatId,
       `<b>Quick task creation</b>
 
-<code>/new &lt;title&gt; [· client:X] [· deliv:Y] [· due:Fri] [· priority:P1]</code>
+${
+  aiEnabled()
+    ? `Type <i>naturally</i> or send a <b>voice note</b>:
+<i>"Reel for APX due Friday, P1, shoot next Monday"</i>
+
+Or use the explicit syntax:
+`
+    : ""
+}<code>/new &lt;title&gt; [· client:X] [· deliv:Y] [· due:Fri] [· priority:P1]</code>
 
 <b>Examples</b>
 <code>/new APX Reels pack · due:Fri · priority:P1</code>
@@ -438,46 +564,97 @@ async function handleNewCommand(
   }
 
   const parsed = parseNewTaskArgs(raw);
-  if (!parsed.title) {
+  const hasExplicitSyntax =
+    /[·|;]/.test(raw) || /\b[a-z]+\s*[:=]\s*\S/i.test(raw);
+
+  let draft: Partial<typeof parsed> & {
+    title?: string;
+    client?: string;
+    deliverable?: string;
+    serviceLine?: string;
+    priority?: string;
+    status?: string;
+    due?: string;
+    shoot?: string;
+    assignee?: string;
+    unknown?: string[];
+  } = parsed;
+  let extracted: ExtractedTask | null = null;
+  let missingFields: string[] = [];
+
+  if (aiEnabled() && !hasExplicitSyntax) {
+    try {
+      const ctx = await buildExtractionContext(cfg);
+      extracted = await extractNewTask(raw, ctx);
+      if (extracted.title) {
+        draft = {
+          title: extracted.title,
+          client: extracted.client || undefined,
+          deliverable: extracted.deliverable || undefined,
+          priority: extracted.priority || undefined,
+          due: extracted.due || undefined,
+          shoot: extracted.shoot || undefined,
+          assignee: extracted.assignee || undefined,
+          unknown: [],
+        };
+        missingFields = extracted.missing ?? [];
+      }
+    } catch (e) {
+      console.warn("[new ai]", (e as Error).message);
+    }
+  }
+
+  if (!draft.title) {
     await sendMessageHtml(
       token,
       chatId,
-      "<b>Need a title</b>\nUsage: <code>/new Title here · due:Fri</code>",
+      "<b>Need a title</b>\nTry: <i>\"Reel for APX due Friday\"</i> or <code>/new Title · due:Fri</code>",
       mainMenuKeyboard(),
     );
     return;
   }
 
-  if (!parsed.assignee) {
+  if (!draft.assignee) {
     const myAssignee = await findAssigneeForTelegramId(cfg, fromId).catch(
       () => null,
     );
-    if (myAssignee) parsed.assignee = myAssignee;
+    if (myAssignee) draft.assignee = myAssignee;
   }
 
   try {
     const row = await createProductionTask(cfg, {
-      title: parsed.title,
-      client: parsed.client,
-      deliverable: parsed.deliverable,
-      serviceLine: parsed.serviceLine,
-      priority: parsed.priority,
-      status: parsed.status,
-      due: parsed.due,
-      shoot: parsed.shoot,
-      assignee: parsed.assignee,
+      title: draft.title,
+      client: draft.client,
+      deliverable: draft.deliverable,
+      serviceLine: draft.serviceLine,
+      priority: draft.priority,
+      status: draft.status,
+      due: draft.due,
+      shoot: draft.shoot,
+      assignee: draft.assignee,
       telegramUserId: fromId,
     });
 
-    const unknownNote =
-      parsed.unknown.length > 0
-        ? `\n\n<i>Ignored tokens:</i> <code>${esc(parsed.unknown.join(" · "))}</code>`
-        : "";
+    const notes: string[] = [];
+    if (draft.unknown && draft.unknown.length > 0) {
+      notes.push(
+        `<i>Ignored tokens:</i> <code>${esc(draft.unknown.join(" · "))}</code>`,
+      );
+    }
+    if (missingFields.length > 0) {
+      notes.push(
+        `<i>Tip — missing:</i> ${missingFields
+          .slice(0, 4)
+          .map((f) => `<code>${esc(f)}</code>`)
+          .join(" · ")}. Reply with e.g. <code>due:Mon</code> or <code>priority:P1</code>.`,
+      );
+    }
+    const noteLine = notes.length > 0 ? `\n\n${notes.join("\n")}` : "";
 
     await sendMessageHtml(
       token,
       chatId,
-      `<b>Task created</b>${unknownNote}\n\n${formatTaskCard(row)}`,
+      `<b>Task created</b>${noteLine}\n\n${formatTaskCard(row)}`,
       taskActionKeyboard(row.id, row.url),
     );
   } catch (e) {
@@ -490,6 +667,30 @@ async function handleNewCommand(
       mainMenuKeyboard(),
     );
   }
+}
+
+async function buildExtractionContext(
+  cfg: BotConfig,
+): Promise<ExtractionContext> {
+  const [catalog, statuses] = await Promise.all([
+    loadAssigneeLinkCatalog(cfg).catch(() => ({
+      displayNames: [],
+      emailToDisplay: {},
+    })),
+    fetchStatusOptionNames(cfg).catch(() => [] as string[]),
+  ]);
+  return {
+    knownClients: [],
+    knownAssignees: catalog.displayNames,
+    knownDeliverables: [],
+    knownPriorities: [
+      "P0 — Today",
+      "P1 — This week",
+      "P2 — Later this week",
+      "P3 — Later this month",
+    ],
+    knownStatuses: statuses,
+  };
 }
 
 async function handleFindCommand(

@@ -1,0 +1,287 @@
+/**
+ * Minimal OpenAI client: voice transcription, structured task extraction,
+ * and a single intent router for free-form messages.
+ * Enabled whenever OPENAI_API_KEY is present.
+ */
+
+const CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const AUDIO_URL = "https://api.openai.com/v1/audio/transcriptions";
+
+const CHAT_TIMEOUT_MS = 30_000;
+const AUDIO_TIMEOUT_MS = 120_000;
+const MAX_AUDIO_BYTES = 24 * 1024 * 1024;
+
+export function aiEnabled(): boolean {
+  return Boolean(process.env.OPENAI_API_KEY?.trim());
+}
+
+function chatModel(): string {
+  return process.env.OPENAI_MODEL?.trim() || "gpt-5.4";
+}
+
+function audioModel(): string {
+  return process.env.OPENAI_AUDIO_MODEL?.trim() || "whisper-1";
+}
+
+function todayISO(): string {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+async function timedFetch(
+  url: string,
+  init: RequestInit & { timeoutMs?: number },
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    init.timeoutMs ?? CHAT_TIMEOUT_MS,
+  );
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Transcribe an audio buffer (Telegram voice .oga/.ogg) via OpenAI audio model. */
+export async function transcribeAudio(
+  audio: ArrayBuffer,
+  filename: string,
+): Promise<string> {
+  if (!aiEnabled()) throw new Error("OPENAI_API_KEY not set");
+  if (audio.byteLength > MAX_AUDIO_BYTES) {
+    throw new Error("Audio too large (max 24MB).");
+  }
+
+  const form = new FormData();
+  form.append("file", new Blob([audio]), filename || "voice.ogg");
+  form.append("model", audioModel());
+  form.append("response_format", "json");
+  form.append("temperature", "0");
+
+  const res = await timedFetch(AUDIO_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    body: form,
+    timeoutMs: AUDIO_TIMEOUT_MS,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`OpenAI transcription failed: ${res.status} ${text}`);
+  }
+  const data = JSON.parse(text) as { text?: string };
+  return (data.text ?? "").trim();
+}
+
+async function chatJson<T>(
+  systemPrompt: string,
+  userPrompt: string,
+  schema: Record<string, unknown>,
+  schemaName: string,
+): Promise<T> {
+  if (!aiEnabled()) throw new Error("OPENAI_API_KEY not set");
+
+  const body = {
+    model: chatModel(),
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: schemaName,
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const res = await timedFetch(CHAT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`OpenAI chat failed: ${res.status} ${text}`);
+  }
+
+  const data = JSON.parse(text) as {
+    choices?: { message?: { content?: string } }[];
+  };
+  const content = data.choices?.[0]?.message?.content ?? "";
+  if (!content) throw new Error("OpenAI returned empty content");
+  return JSON.parse(content) as T;
+}
+
+// ── Task extraction ──────────────────────────────────────────────────────────
+
+export type ExtractedTask = {
+  title: string;
+  client: string;
+  deliverable: string;
+  priority: string;
+  due: string;
+  shoot: string;
+  assignee: string;
+  missing: string[];
+  confidence: "high" | "medium" | "low";
+};
+
+const TASK_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    title: { type: "string" },
+    client: { type: "string" },
+    deliverable: { type: "string" },
+    priority: { type: "string" },
+    due: { type: "string", description: "ISO yyyy-mm-dd or empty" },
+    shoot: { type: "string", description: "ISO yyyy-mm-dd or empty" },
+    assignee: { type: "string" },
+    missing: {
+      type: "array",
+      items: { type: "string" },
+      description: "Fields the user didn't specify and that might be worth asking about",
+    },
+    confidence: { type: "string", enum: ["high", "medium", "low"] },
+  },
+  required: [
+    "title",
+    "client",
+    "deliverable",
+    "priority",
+    "due",
+    "shoot",
+    "assignee",
+    "missing",
+    "confidence",
+  ],
+};
+
+export type ExtractionContext = {
+  knownClients: string[];
+  knownAssignees: string[];
+  knownDeliverables: string[];
+  knownPriorities: string[];
+  knownStatuses: string[];
+};
+
+export async function extractNewTask(
+  userText: string,
+  ctx: ExtractionContext,
+): Promise<ExtractedTask> {
+  const system = [
+    `You extract structured production-task fields from a short message or voice transcript.`,
+    `Today is ${todayISO()} (UTC). Interpret relative dates ("Friday", "tomorrow", "in 2 days") against today.`,
+    `Return empty string for fields you cannot infer — never hallucinate values.`,
+    `Priority must be one of the known priorities when the user implies urgency (e.g. "P1", "rush", "urgent" → the P1-like option).`,
+    `Client and deliverable: snap to the closest match from the known lists when the user clearly refers to one.`,
+    `Title is a short imperative noun phrase (e.g. "Reels pack for APX", not a sentence).`,
+    `"missing" should list any high-signal field the user didn't specify (from: due, shoot, client, deliverable, assignee).`,
+  ].join(" ");
+
+  const user = [
+    `Message: """${userText.replace(/"/g, '\\"')}"""`,
+    ``,
+    `Known clients: ${ctx.knownClients.slice(0, 30).join(" | ") || "(none)"}`,
+    `Known assignees: ${ctx.knownAssignees.slice(0, 30).join(" | ") || "(none)"}`,
+    `Known deliverables: ${ctx.knownDeliverables.slice(0, 30).join(" | ") || "(none)"}`,
+    `Known priorities: ${ctx.knownPriorities.join(" | ") || "(none)"}`,
+    `Known statuses: ${ctx.knownStatuses.join(" | ") || "(none)"}`,
+  ].join("\n");
+
+  return chatJson<ExtractedTask>(system, user, TASK_SCHEMA, "new_task");
+}
+
+// ── Intent router ────────────────────────────────────────────────────────────
+
+export type RouterIntent =
+  | { kind: "view"; view: "today" | "week" | "mine" | "overdue" | "board" }
+  | { kind: "find"; query: string }
+  | { kind: "create"; transcriptForExtractor: string }
+  | { kind: "reviews" }
+  | { kind: "shoots" }
+  | { kind: "help" }
+  | { kind: "smalltalk"; reply: string };
+
+type RouterResponse = {
+  kind:
+    | "view"
+    | "find"
+    | "create"
+    | "reviews"
+    | "shoots"
+    | "help"
+    | "smalltalk";
+  view: string;
+  query: string;
+  transcriptForExtractor: string;
+  reply: string;
+};
+
+const INTENT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    kind: {
+      type: "string",
+      enum: ["view", "find", "create", "reviews", "shoots", "help", "smalltalk"],
+    },
+    view: { type: "string" },
+    query: { type: "string" },
+    transcriptForExtractor: { type: "string" },
+    reply: { type: "string" },
+  },
+  required: ["kind", "view", "query", "transcriptForExtractor", "reply"],
+};
+
+export async function routeIntent(userText: string): Promise<RouterIntent> {
+  const system = [
+    `You classify short Telegram messages for a production-task bot.`,
+    `Pick exactly one intent:`,
+    `- view: user wants a list. Set "view" to one of: today | week | mine | overdue | board.`,
+    `- find: user wants to search for a task. Put the keyword(s) in "query".`,
+    `- create: user wants to create a new task. Copy the full message into "transcriptForExtractor".`,
+    `- reviews: user wants tasks they're reviewing (approver).`,
+    `- shoots: user wants upcoming shoots/live dates.`,
+    `- help: user asks what the bot can do.`,
+    `- smalltalk: greetings, thanks, ambiguous. Put a short warm reply (≤20 words) in "reply".`,
+    `Always fill every field — use empty string if unused.`,
+  ].join(" ");
+
+  const r = await chatJson<RouterResponse>(
+    system,
+    `Message: """${userText.replace(/"/g, '\\"')}"""`,
+    INTENT_SCHEMA,
+    "intent",
+  );
+
+  if (r.kind === "view") {
+    const v = r.view as RouterIntent extends { kind: "view"; view: infer V }
+      ? V
+      : never;
+    const allowed = ["today", "week", "mine", "overdue", "board"] as const;
+    if ((allowed as readonly string[]).includes(v)) {
+      return { kind: "view", view: v };
+    }
+    return { kind: "help" };
+  }
+  if (r.kind === "find") return { kind: "find", query: r.query };
+  if (r.kind === "create") {
+    return {
+      kind: "create",
+      transcriptForExtractor: r.transcriptForExtractor || userText,
+    };
+  }
+  if (r.kind === "reviews") return { kind: "reviews" };
+  if (r.kind === "shoots") return { kind: "shoots" };
+  if (r.kind === "help") return { kind: "help" };
+  return { kind: "smalltalk", reply: r.reply || "On it." };
+}
