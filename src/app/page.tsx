@@ -122,6 +122,11 @@ export default function Home() {
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
                 GET /api/telegram/set-webhook?secret=ADMIN_SETUP_SECRET
               </code>
+              {" · "}
+              <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
+                GET /api/telegram/status?secret=ADMIN_SETUP_SECRET
+              </code>{" "}
+              (webhook + env diagnostics)
               . Notion webhooks:{" "}
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
                 /api/notion/webhook

@@ -18,9 +18,21 @@ export async function tgApi(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  const text = await res.text().catch(() => "");
+  let data: { ok?: boolean; description?: string } = {};
+  try {
+    data = JSON.parse(text) as typeof data;
+  } catch {
+    /* non-JSON body */
+  }
   if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Telegram ${method} failed: ${res.status} ${t}`);
+    throw new Error(`Telegram ${method} failed: HTTP ${res.status} ${text}`);
+  }
+  // Telegram often returns HTTP 200 with {"ok":false,"description":"..."} (e.g. bad token, chat not found).
+  if (data.ok === false) {
+    throw new Error(
+      `Telegram ${method} rejected: ${data.description ?? (text || "unknown")}`,
+    );
   }
 }
 

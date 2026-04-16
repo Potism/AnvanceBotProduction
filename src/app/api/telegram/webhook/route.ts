@@ -9,6 +9,9 @@ export async function POST(req: NextRequest) {
   if (secret) {
     const header = req.headers.get("x-telegram-bot-api-secret-token");
     if (header !== secret) {
+      console.warn(
+        "[telegram webhook] 403: X-Telegram-Bot-Api-Secret-Token mismatch or missing. Align TELEGRAM_WEBHOOK_SECRET in Vercel with setWebhook secret_token (or clear both).",
+      );
       return new Response("Forbidden", { status: 403 });
     }
   }
@@ -23,7 +26,10 @@ export async function POST(req: NextRequest) {
   try {
     await handleTelegramUpdate(update);
   } catch (e) {
-    console.error("Telegram webhook handler error", e);
+    console.error(
+      "[telegram webhook] handler error (user may see no reply):",
+      e,
+    );
   }
 
   return new Response("OK", { status: 200 });
