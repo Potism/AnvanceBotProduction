@@ -3,6 +3,10 @@ import Link from "next/link";
 const envRows = [
   ["NOTION_TOKEN", "Internal integration secret"],
   ["NOTION_DATABASE_ID", "Production database id"],
+  [
+    "NOTION_WEBHOOK_VERIFICATION_TOKEN",
+    "Optional; verification_token from Notion webhook setup (validates signatures)",
+  ],
   ["TELEGRAM_BOT_TOKEN", "From BotFather"],
   ["NEXT_PUBLIC_APP_URL", "Public site URL for webhooks"],
   ["TELEGRAM_WEBHOOK_SECRET", "Optional; must match Telegram secret header"],
@@ -118,6 +122,12 @@ export default function Home() {
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
                 GET /api/telegram/set-webhook?secret=ADMIN_SETUP_SECRET
               </code>
+              . Notion integration webhooks:{" "}
+              <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
+                /api/notion/webhook
+              </code>{" "}
+              (see Vercel logs for the verification token, then optional{" "}
+              <code className="text-[11px]">NOTION_WEBHOOK_VERIFICATION_TOKEN</code>).
             </p>
           </div>
         </section>
