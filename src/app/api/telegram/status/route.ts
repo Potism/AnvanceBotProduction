@@ -1,4 +1,8 @@
 import { getBotConfig, isBotConfigured } from "@/lib/config";
+import {
+  isValidTelegramWebhookSecretToken,
+  telegramWebhookSecretTokenIssue,
+} from "@/lib/telegram/webhook-secret";
 import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
@@ -40,16 +44,26 @@ export async function GET(req: NextRequest) {
   const cfg = getBotConfig();
   const hints: string[] = [];
 
+  const wh = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (wh?.trim()) {
+    const issue = telegramWebhookSecretTokenIssue(wh);
+    if (issue) {
+      hints.unshift(issue);
+    }
+  }
+
   if (!isBotConfigured()) {
     hints.push(
       "Bot handler needs NOTION_TOKEN + NOTION_DATABASE_ID + TELEGRAM_BOT_TOKEN on Vercel (Production), then redeploy.",
     );
   }
 
-  if (process.env.TELEGRAM_WEBHOOK_SECRET) {
-    hints.push(
-      "TELEGRAM_WEBHOOK_SECRET is set: every update must include header X-Telegram-Bot-Api-Secret-Token with the same value. Re-run set-webhook, or remove TELEGRAM_WEBHOOK_SECRET and set-webhook again without secret_token.",
-    );
+  if (process.env.TELEGRAM_WEBHOOK_SECRET?.trim()) {
+    if (isValidTelegramWebhookSecretToken(process.env.TELEGRAM_WEBHOOK_SECRET)) {
+      hints.push(
+        "TELEGRAM_WEBHOOK_SECRET format is valid. It must match what set-webhook sent as secret_token (re-run set-webhook after any change).",
+      );
+    }
   }
 
   const lastErr = info.result?.last_error_message;
@@ -86,6 +100,9 @@ export async function GET(req: NextRequest) {
       hasTelegramToken: Boolean(cfg.telegramBotToken),
       nextPublicAppUrl: cfg.publicAppUrl || null,
       telegramWebhookSecretSet: Boolean(cfg.telegramWebhookSecret),
+      telegramWebhookSecretFormatOk: wh?.trim()
+        ? isValidTelegramWebhookSecretToken(wh)
+        : null,
     },
     hints,
   });

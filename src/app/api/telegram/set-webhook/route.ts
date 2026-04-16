@@ -1,3 +1,4 @@
+import { telegramWebhookSecretTokenIssue } from "@/lib/telegram/webhook-secret";
 import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
@@ -21,11 +22,18 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  if (whSecret && whSecret.length > 256) {
+  const secretIssue = telegramWebhookSecretTokenIssue(whSecret);
+  if (whSecret && secretIssue) {
     return Response.json(
       {
         ok: false,
-        error: "TELEGRAM_WEBHOOK_SECRET must be at most 256 characters for Telegram secret_token",
+        httpStatus: 400,
+        error: secretIssue,
+        debug: {
+          reason: "Telegram secret_token only allows A–Z, a–z, 0–9, _, - (no colons).",
+          fix:
+            "Vercel → set TELEGRAM_WEBHOOK_SECRET to e.g. output of openssl rand -hex 32 → redeploy → set-webhook?secret=…&reset=1",
+        },
       },
       { status: 400 },
     );
