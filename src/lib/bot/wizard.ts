@@ -299,19 +299,23 @@ async function render(cfg: BotConfig, s: Session): Promise<void> {
   touch(s);
 }
 
-/** Entry point — called when user types /new with no args, or taps the button. */
+/** Entry point — called when user types /new with no args, or taps the button.
+ *  If `initialTitle` is provided (e.g. `/new wedding shoot`), we skip step 1
+ *  and jump straight to the client picker. */
 export async function startWizard(
   cfg: BotConfig,
   chatId: number,
   userId: number,
   messageId?: number,
+  initialTitle?: string,
 ): Promise<void> {
+  const t = (initialTitle ?? "").trim();
   const s: Session = {
     chatId,
     userId,
     messageId,
-    step: "title",
-    draft: {},
+    step: t ? "client" : "title",
+    draft: t ? { title: t } : {},
     clients: [],
     deliverables: [],
     expires: Date.now() + TTL_MS,
