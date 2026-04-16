@@ -122,12 +122,16 @@ export default function Home() {
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
                 GET /api/telegram/set-webhook?secret=ADMIN_SETUP_SECRET
               </code>
-              . Notion integration webhooks:{" "}
+              . Notion webhooks:{" "}
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px] text-zinc-200">
                 /api/notion/webhook
               </code>{" "}
-              (see Vercel logs for the verification token, then optional{" "}
-              <code className="text-[11px]">NOTION_WEBHOOK_VERIFICATION_TOKEN</code>).
+              — after Resend,{" "}
+              <code className="text-[11px]">
+                GET …/api/notion/webhook?secret=ADMIN_SETUP_SECRET
+              </code>{" "}
+              or Vercel logs; then optional{" "}
+              <code className="text-[11px]">NOTION_WEBHOOK_VERIFICATION_TOKEN</code>.
             </p>
           </div>
         </section>

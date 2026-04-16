@@ -4,6 +4,12 @@ import { NextRequest } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+/** Last verification_token from Notion (same isolate; best-effort on serverless). */
+const notionSetup = globalThis as typeof globalThis & {
+  __notionLastVerificationToken?: string;
+  __notionLastVerificationAt?: number;
+};
+
 /** Notion's one-time subscription verification body shape. */
 function isVerificationOnlyPayload(
   body: unknown,
@@ -47,6 +53,8 @@ export async function POST(req: NextRequest) {
 
   if (isVerificationOnlyPayload(parsed)) {
     const { verification_token } = parsed;
+    notionSetup.__notionLastVerificationToken = verification_token;
+    notionSetup.__notionLastVerificationAt = Date.now();
     console.info(
       "[notion webhook] Paste verification_token in Notion → Webhooks → Verify:",
       verification_token,
@@ -81,9 +89,30 @@ export async function POST(req: NextRequest) {
   return Response.json({ ok: true });
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const admin = req.nextUrl.searchParams.get("secret");
+  if (admin && admin === process.env.ADMIN_SETUP_SECRET) {
+    const token = notionSetup.__notionLastVerificationToken;
+    const at = notionSetup.__notionLastVerificationAt;
+    if (token) {
+      return Response.json({
+        ok: true,
+        verification_token: token,
+        received_at_ms: at,
+        hint: "Paste verification_token into Notion → Verify subscription. If empty next time, click Resend in Notion then open this URL again (same browser tab is fine).",
+      });
+    }
+    return Response.json(
+      {
+        ok: false,
+        hint: "No token in memory yet. In Notion: Resend token, wait ~5s, refresh this page. If it stays empty, open Vercel logs for the POST /api/notion/webhook row (token is in the JSON response body there).",
+      },
+      { status: 404 },
+    );
+  }
+
   return Response.json({
     ok: true,
-    hint: "Notion POSTs here for subscription verification and workspace events.",
+    hint: "Notion POSTs here for verification and events. After Notion sends the token, open GET with ?secret=ADMIN_SETUP_SECRET (same value as Telegram set-webhook) to read the last verification_token from this server instance.",
   });
 }
