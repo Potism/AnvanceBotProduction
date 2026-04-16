@@ -1,6 +1,11 @@
 import type { BotConfig } from "../types";
 import { createProductionTask, findAssigneeForTelegramId } from "../notion/actions";
 import { loadProductionCatalog } from "../notion/production-catalog";
+import {
+  loadAssigneeLinkCatalog,
+  matchAssigneeInput,
+  type AssigneeLinkCatalog,
+} from "../notion/production-assignees";
 import { parseFriendlyDate } from "./new-task-parse";
 import { aiEnabled, aiParseDate } from "../ai/openai";
 import {
@@ -19,12 +24,14 @@ type Step =
   | "deliverable"
   | "due"
   | "priority"
+  | "assignee"
   | "shoot"
   | "review"
   | "custom_client"
   | "custom_deliverable"
   | "custom_due"
   | "custom_shoot"
+  | "custom_assignee"
   | "custom_title";
 
 type Draft = {
@@ -34,6 +41,7 @@ type Draft = {
   priority?: string;
   due?: string;
   shoot?: string;
+  assignee?: string;
 };
 
 type Session = {
@@ -44,6 +52,9 @@ type Session = {
   draft: Draft;
   clients: string[];
   deliverables: string[];
+  assignees: string[];
+  /** Email → display name map for typed-email matching. */
+  emailToDisplay: Record<string, string>;
   /** Calendar view year/month (0-indexed) while the calendar is open. */
   calYear?: number;
   calMonth?: number;
@@ -145,6 +156,7 @@ function draftLines(d: Draft): string {
     ["📅 Due", d.due],
     ["🎬 Shoot", d.shoot],
     ["⚡ Priority", d.priority],
+    ["👤 Assignee", d.assignee],
   ];
   return pairs
     .filter(([, v]) => v)
@@ -173,6 +185,10 @@ function stepHeader(step: Step, d: Draft): string {
       return `${head}<b>Step 4/5 · Due date</b>\nType the date — natural language works: <i>next friday</i>, <i>end of month</i>, <i>+3d</i>, <i>2026-05-01</i>.`;
     case "priority":
       return `${head}<b>Step 5/5 · Priority</b>\nPick one or skip.`;
+    case "assignee":
+      return `${head}<b>Optional · Assignee</b>\nPick a teammate, type a name or email, or leave as <b>Me</b>.`;
+    case "custom_assignee":
+      return `${head}<b>Optional · Assignee</b>\nType the teammate's <b>name</b> or <b>work email</b>.`;
     case "shoot":
       return `${head}<b>Optional · Shoot date</b>\nTap a day, use a shortcut, or type anything.`;
     case "custom_shoot":
@@ -288,6 +304,7 @@ function keyboardFor(session: Session): ReplyMarkup {
     case "custom_deliverable":
     case "custom_due":
     case "custom_shoot":
+    case "custom_assignee":
       return { inline_keyboard: [kbCancelRow()] };
 
     case "client": {
@@ -335,6 +352,19 @@ function keyboardFor(session: Session): ReplyMarkup {
           kbCancelRow(),
         ],
       };
+    case "assignee": {
+      const rows: InlineKeyboardButton[][] = [];
+      rows.push([{ text: "👤 Me", callback_data: "n:asg:me" }]);
+      const show = session.assignees.slice(0, 6);
+      const peopleRows = optionButtons("n:asg", show, 6);
+      for (const r of peopleRows) rows.push(r);
+      rows.push([
+        { text: "✉️ Type email / name", callback_data: "n:asg_cst" },
+        { text: "⏭ Skip", callback_data: "n:skp" },
+      ]);
+      rows.push(kbCancelRow());
+      return { inline_keyboard: rows };
+    }
     case "review":
       return {
         inline_keyboard: [
@@ -351,6 +381,7 @@ function keyboardFor(session: Session): ReplyMarkup {
             { text: "✏️ Edit shoot", callback_data: "n:ed:shoot" },
             { text: "✏️ Edit priority", callback_data: "n:ed:priority" },
           ],
+          [{ text: "✏️ Edit assignee", callback_data: "n:ed:assignee" }],
           kbCancelRow(),
         ],
       };
@@ -390,6 +421,8 @@ export async function startWizard(
     draft: t ? { title: t } : {},
     clients: [],
     deliverables: [],
+    assignees: [],
+    emailToDisplay: {},
     expires: Date.now() + TTL_MS,
   };
   sessions.set(userId, s);
@@ -401,6 +434,25 @@ export async function startWizard(
       if (!cur) return;
       cur.clients = cat.clients;
       cur.deliverables = cat.deliverables;
+      cur.assignees = cat.assignees;
+      touch(cur);
+    })
+    .catch(() => {});
+  loadAssigneeLinkCatalog(cfg)
+    .then((cat) => {
+      const cur = get(userId);
+      if (!cur) return;
+      cur.emailToDisplay = cat.emailToDisplay;
+      // Merge any extra display names surfaced by the People API that aren't in
+      // the sampled production rows yet (new teammates, recently added, etc.).
+      const seen = new Set(cur.assignees);
+      for (const name of cat.displayNames) {
+        if (!seen.has(name)) {
+          cur.assignees.push(name);
+          seen.add(name);
+        }
+      }
+      cur.assignees.sort((a, b) => a.localeCompare(b));
       touch(cur);
     })
     .catch(() => {});
@@ -459,6 +511,20 @@ export async function handleWizardText(
       }
       s.draft.shoot = iso;
       s.step = "review";
+      break;
+    }
+    case "custom_assignee": {
+      const assignee = await resolveAssignee(cfg, v, s);
+      if (!assignee) {
+        await sendMessageHtml(
+          cfg.telegramBotToken,
+          s.chatId,
+          `<i>No match for "${esc(v)}". Send a fuller name, or the exact work email. Type <code>/cancel</code> to abort.</i>`,
+        );
+        return true;
+      }
+      s.draft.assignee = assignee;
+      s.step = "shoot";
       break;
     }
     default:
@@ -642,8 +708,32 @@ export async function handleWizardCallback(
     const code = parts[2] ?? "";
     const p = PRIORITIES.find((x) => x.code === code);
     if (p) s.draft.priority = p.value;
-    s.step = "shoot";
+    s.step = "assignee";
     await render(cfg, s);
+    return true;
+  }
+
+  if (parts[1] === "asg") {
+    const raw = parts[2] ?? "";
+    if (raw === "me") {
+      s.draft.assignee = undefined; // sentinel: default to caller on create
+      s.step = "shoot";
+      await render(cfg, s);
+      return true;
+    }
+    const idx = Number.parseInt(raw, 10);
+    if (Number.isFinite(idx) && s.assignees[idx]) {
+      s.draft.assignee = s.assignees[idx];
+      s.step = "shoot";
+      await render(cfg, s);
+    }
+    return true;
+  }
+  if (parts[1] === "asg_cst") {
+    s.step = "custom_assignee";
+    s.messageId = undefined;
+    await sendMessageHtml(token, chatId, stepHeader(s.step, s.draft), keyboardFor(s));
+    touch(s);
     return true;
   }
 
@@ -655,8 +745,9 @@ export async function handleWizardCallback(
     else if (field === "due") s.step = "custom_due";
     else if (field === "shoot") s.step = "custom_shoot";
     else if (field === "priority") s.step = "priority";
+    else if (field === "assignee") s.step = "assignee";
     s.messageId = undefined;
-    if (s.step === "priority") {
+    if (s.step === "priority" || s.step === "assignee") {
       await render(cfg, s);
     } else {
       await sendMessageHtml(token, chatId, stepHeader(s.step, s.draft), keyboardFor(s));
@@ -672,6 +763,40 @@ export async function handleWizardCallback(
   }
 
   return true; // consumed
+}
+
+/** Match typed name/email to a real Notion assignee. Live-loads the catalog
+ *  if the session hasn't populated it yet (e.g. very fast wizard entry). */
+async function resolveAssignee(
+  cfg: BotConfig,
+  raw: string,
+  s: Session,
+): Promise<string | null> {
+  const catalog: AssigneeLinkCatalog = {
+    displayNames: s.assignees,
+    emailToDisplay: s.emailToDisplay,
+  };
+  const hasAny =
+    catalog.displayNames.length > 0 ||
+    Object.keys(catalog.emailToDisplay).length > 0;
+  if (!hasAny) {
+    try {
+      const fresh = await loadAssigneeLinkCatalog(cfg);
+      s.assignees = fresh.displayNames;
+      s.emailToDisplay = fresh.emailToDisplay;
+      catalog.displayNames = fresh.displayNames;
+      catalog.emailToDisplay = fresh.emailToDisplay;
+    } catch {
+      /* fall through — accept the raw value */
+    }
+  }
+  const match = matchAssigneeInput(raw, catalog);
+  if (match.ok) return match.assignee;
+  // Accept plain free-text names even if the catalog is empty or the user
+  // wrote a brand-new teammate. Only reject email-looking input that didn't
+  // resolve to anything (avoids writing a non-existent work email).
+  if (raw.includes("@")) return null;
+  return raw.trim() || null;
 }
 
 /** Deterministic parser first (fast, free), AI fallback for fuzzy phrases. */
@@ -711,6 +836,9 @@ function advanceSkip(s: Session) {
       s.step = "priority";
       break;
     case "priority":
+      s.step = "assignee";
+      break;
+    case "assignee":
       s.step = "shoot";
       break;
     case "shoot":
@@ -728,12 +856,14 @@ async function createFromDraft(cfg: BotConfig, s: Session): Promise<void> {
     return;
   }
 
-  let assignee: string | undefined;
-  try {
-    const a = await findAssigneeForTelegramId(cfg, s.userId);
-    if (a) assignee = a;
-  } catch {
-    /* non-fatal */
+  let assignee: string | undefined = s.draft.assignee?.trim() || undefined;
+  if (!assignee) {
+    try {
+      const a = await findAssigneeForTelegramId(cfg, s.userId);
+      if (a) assignee = a;
+    } catch {
+      /* non-fatal */
+    }
   }
 
   try {
