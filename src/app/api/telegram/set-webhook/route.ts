@@ -34,6 +34,26 @@ export async function GET(req: NextRequest) {
     },
   );
 
-  const body = await res.json().catch(() => ({}));
-  return Response.json({ ok: res.ok, telegram: body, webhookUrl: url });
+  const body = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    description?: string;
+  };
+
+  // Telegram often returns HTTP 200 with {"ok":false,"description":"..."} (invalid token, bad URL, etc.).
+  const telegramAccepted = body.ok === true;
+  const ok = res.ok && telegramAccepted;
+
+  return Response.json(
+    {
+      ok,
+      httpStatus: res.status,
+      telegram: body,
+      webhookUrl: url,
+      hint: telegramAccepted
+        ? "Webhook registered. Re-check GET /api/telegram/status?secret=…"
+        : body.description ??
+          "Telegram rejected setWebhook. Fix description, then try again.",
+    },
+    { status: ok ? 200 : 502 },
+  );
 }
