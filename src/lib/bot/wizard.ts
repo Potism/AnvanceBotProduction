@@ -2,6 +2,7 @@ import type { BotConfig } from "../types";
 import { createProductionTask, findAssigneeForTelegramId } from "../notion/actions";
 import { loadProductionCatalog } from "../notion/production-catalog";
 import { parseFriendlyDate } from "./new-task-parse";
+import { aiEnabled, aiParseDate } from "../ai/openai";
 import {
   editMessageTextHtml,
   sendMessageHtml,
@@ -43,6 +44,11 @@ type Session = {
   draft: Draft;
   clients: string[];
   deliverables: string[];
+  /** Calendar view year/month (0-indexed) while the calendar is open. */
+  calYear?: number;
+  calMonth?: number;
+  /** Which field the calendar is picking: "due" | "sht". */
+  calField?: "d" | "s";
   expires: number;
 };
 
@@ -162,18 +168,116 @@ function stepHeader(step: Step, d: Draft): string {
     case "custom_deliverable":
       return `${head}<b>Step 3/5 · Deliverable</b>\nType the deliverable name.`;
     case "due":
-      return `${head}<b>Step 4/5 · Due date</b>\nPick a quick date, type one (e.g. <code>+3d</code>, <code>Fri</code>, <code>2026-05-01</code>), or skip.`;
+      return `${head}<b>Step 4/5 · Due date</b>\nTap a day on the calendar, use the shortcuts, or <i>type anything</i> (e.g. <code>next friday</code>, <code>end of month</code>, <code>+3d</code>).`;
     case "custom_due":
-      return `${head}<b>Step 4/5 · Due date</b>\nType the date (e.g. <code>+3d</code>, <code>Fri</code>, <code>2026-05-01</code>).`;
+      return `${head}<b>Step 4/5 · Due date</b>\nType the date — natural language works: <i>next friday</i>, <i>end of month</i>, <i>+3d</i>, <i>2026-05-01</i>.`;
     case "priority":
       return `${head}<b>Step 5/5 · Priority</b>\nPick one or skip.`;
     case "shoot":
-      return `${head}<b>Optional · Shoot date</b>\nPick or skip.`;
+      return `${head}<b>Optional · Shoot date</b>\nTap a day, use a shortcut, or type anything.`;
     case "custom_shoot":
-      return `${head}<b>Optional · Shoot date</b>\nType the date.`;
+      return `${head}<b>Optional · Shoot date</b>\nType the date — natural language works.`;
     case "review":
       return `${head}<b>Review</b>\nCreate this task?`;
   }
+}
+
+// ── Calendar ─────────────────────────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+function todayUTC(): { y: number; m: number; d: number } {
+  const now = new Date();
+  return {
+    y: now.getUTCFullYear(),
+    m: now.getUTCMonth(),
+    d: now.getUTCDate(),
+  };
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
+
+function isoFromYMD(y: number, m0: number, d: number): string {
+  return `${y}-${pad2(m0 + 1)}-${pad2(d)}`;
+}
+
+function calendarKeyboard(field: "d" | "s", year: number, month0: number): ReplyMarkup {
+  const first = new Date(Date.UTC(year, month0, 1));
+  const daysInMonth = new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+  // Monday-first week: Mon=0, Sun=6.
+  const firstCol = (first.getUTCDay() + 6) % 7;
+
+  const today = todayUTC();
+  const todayISO = isoFromYMD(today.y, today.m, today.d);
+
+  const rows: InlineKeyboardButton[][] = [];
+
+  // Header row: ‹  Month Year  ›
+  rows.push([
+    { text: "‹", callback_data: `n:c:${field}:p` },
+    { text: `${MONTH_NAMES[month0]} ${year}`, callback_data: "n:c:_" },
+    { text: "›", callback_data: `n:c:${field}:n` },
+  ]);
+
+  // Weekday header
+  rows.push(
+    ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map((w) => ({
+      text: w,
+      callback_data: "n:c:_",
+    })),
+  );
+
+  // Day cells
+  let row: InlineKeyboardButton[] = [];
+  for (let i = 0; i < firstCol; i++) {
+    row.push({ text: " ", callback_data: "n:c:_" });
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const iso = isoFromYMD(year, month0, d);
+    const label = iso === todayISO ? `·${d}·` : String(d);
+    row.push({ text: label, callback_data: `n:c:${field}:d:${iso}` });
+    if (row.length === 7) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) {
+    while (row.length < 7) row.push({ text: " ", callback_data: "n:c:_" });
+    rows.push(row);
+  }
+
+  // Footer shortcuts
+  rows.push([
+    { text: "📅 Today", callback_data: `n:c:${field}:t` },
+    { text: "➡️ Tomorrow", callback_data: `n:c:${field}:tm` },
+  ]);
+  rows.push([
+    { text: "✍️ Type date", callback_data: `n:c:${field}:cst` },
+    { text: "⏭ Skip", callback_data: "n:skp" },
+  ]);
+  rows.push(kbCancelRow());
+  return { inline_keyboard: rows };
+}
+
+function stepNeedsCalendar(step: Step): "d" | "s" | null {
+  if (step === "due") return "d";
+  if (step === "shoot") return "s";
+  return null;
 }
 
 function keyboardFor(session: Session): ReplyMarkup {
@@ -204,50 +308,18 @@ function keyboardFor(session: Session): ReplyMarkup {
       rows.push(kbCancelRow());
       return { inline_keyboard: rows };
     }
-    case "due":
-      return {
-        inline_keyboard: [
-          [
-            { text: "📅 Today", callback_data: "n:due:today" },
-            { text: "➡️ Tomorrow", callback_data: "n:due:tmr" },
-          ],
-          [
-            { text: "🗓 Friday", callback_data: "n:due:fri" },
-            { text: "📆 Next Monday", callback_data: "n:due:nmon" },
-          ],
-          [
-            { text: "+2 days", callback_data: "n:due:2d" },
-            { text: "+1 week", callback_data: "n:due:1w" },
-          ],
-          [
-            { text: "✍️ Type date", callback_data: "n:due_cst" },
-            { text: "⏭ Skip", callback_data: "n:skp" },
-          ],
-          kbCancelRow(),
-        ],
-      };
-    case "shoot":
-      return {
-        inline_keyboard: [
-          [
-            { text: "📅 Today", callback_data: "n:sht:today" },
-            { text: "➡️ Tomorrow", callback_data: "n:sht:tmr" },
-          ],
-          [
-            { text: "🗓 Friday", callback_data: "n:sht:fri" },
-            { text: "📆 Next Monday", callback_data: "n:sht:nmon" },
-          ],
-          [
-            { text: "+3 days", callback_data: "n:sht:3d" },
-            { text: "+1 week", callback_data: "n:sht:1w" },
-          ],
-          [
-            { text: "✍️ Type date", callback_data: "n:sht_cst" },
-            { text: "⏭ Skip", callback_data: "n:skp" },
-          ],
-          kbCancelRow(),
-        ],
-      };
+    case "due": {
+      const t = todayUTC();
+      const y = session.calYear ?? t.y;
+      const m = session.calMonth ?? t.m;
+      return calendarKeyboard("d", y, m);
+    }
+    case "shoot": {
+      const t = todayUTC();
+      const y = session.calYear ?? t.y;
+      const m = session.calMonth ?? t.m;
+      return calendarKeyboard("s", y, m);
+    }
     case "priority":
       return {
         inline_keyboard: [
@@ -362,12 +434,12 @@ export async function handleWizardText(
       s.step = "due";
       break;
     case "custom_due": {
-      const iso = parseFriendlyDate(v);
+      const iso = await resolveDate(v);
       if (!iso) {
         await sendMessageHtml(
           cfg.telegramBotToken,
           s.chatId,
-          `<i>Didn't understand "${esc(v)}". Try <code>today</code>, <code>tomorrow</code>, <code>+3d</code>, <code>Fri</code>, or <code>2026-05-01</code>.</i>`,
+          `<i>Didn't understand "${esc(v)}". Try <code>next friday</code>, <code>end of month</code>, <code>+3d</code>, or <code>2026-05-01</code>.</i>`,
         );
         return true;
       }
@@ -376,12 +448,12 @@ export async function handleWizardText(
       break;
     }
     case "custom_shoot": {
-      const iso = parseFriendlyDate(v);
+      const iso = await resolveDate(v);
       if (!iso) {
         await sendMessageHtml(
           cfg.telegramBotToken,
           s.chatId,
-          `<i>Didn't understand "${esc(v)}". Try <code>+3d</code>, <code>Fri</code>, or <code>2026-05-01</code>.</i>`,
+          `<i>Didn't understand "${esc(v)}". Try <code>next friday</code>, <code>+3d</code>, or <code>2026-05-01</code>.</i>`,
         );
         return true;
       }
@@ -399,17 +471,29 @@ export async function handleWizardText(
         s.draft.deliverable = v;
         s.step = "due";
       } else if (s.step === "due") {
-        const iso = parseFriendlyDate(v);
+        const iso = await resolveDate(v);
         if (!iso) {
           await sendMessageHtml(
             cfg.telegramBotToken,
             s.chatId,
-            `<i>Didn't understand "${esc(v)}". Try <code>Fri</code>, <code>+3d</code>, or <code>2026-05-01</code>.</i>`,
+            `<i>Didn't understand "${esc(v)}". Try <code>next friday</code>, <code>end of month</code>, <code>+3d</code>, or <code>2026-05-01</code>.</i>`,
           );
           return true;
         }
         s.draft.due = iso;
         s.step = "priority";
+      } else if (s.step === "shoot") {
+        const iso = await resolveDate(v);
+        if (!iso) {
+          await sendMessageHtml(
+            cfg.telegramBotToken,
+            s.chatId,
+            `<i>Didn't understand "${esc(v)}". Try <code>next friday</code>, <code>+3d</code>, or <code>2026-05-01</code>.</i>`,
+          );
+          return true;
+        }
+        s.draft.shoot = iso;
+        s.step = "review";
       } else {
         return true;
       }
@@ -499,33 +583,58 @@ export async function handleWizardCallback(
     return true;
   }
 
-  if (parts[1] === "due") {
-    const iso = quickPickToIso(parts[2] ?? "");
-    if (iso) s.draft.due = iso;
-    s.step = "priority";
-    await render(cfg, s);
-    return true;
-  }
-  if (parts[1] === "due_cst") {
-    s.step = "custom_due";
-    s.messageId = undefined;
-    await sendMessageHtml(token, chatId, stepHeader(s.step, s.draft), keyboardFor(s));
-    touch(s);
-    return true;
-  }
+  // Calendar: n:c:<field>:<action>[:<iso>]
+  //   field = "d" | "s"   action = "p" | "n" | "d" | "t" | "tm" | "cst" | "_"
+  if (parts[1] === "c") {
+    if (parts[2] === "_") return true; // noop (header / empty cell)
+    const field = parts[2] as "d" | "s";
+    const action = parts[3] ?? "";
+    const t = todayUTC();
+    let y = s.calYear ?? t.y;
+    let m = s.calMonth ?? t.m;
 
-  if (parts[1] === "sht") {
-    const iso = quickPickToIso(parts[2] ?? "");
-    if (iso) s.draft.shoot = iso;
-    s.step = "review";
-    await render(cfg, s);
-    return true;
-  }
-  if (parts[1] === "sht_cst") {
-    s.step = "custom_shoot";
-    s.messageId = undefined;
-    await sendMessageHtml(token, chatId, stepHeader(s.step, s.draft), keyboardFor(s));
-    touch(s);
+    if (action === "p") {
+      m -= 1;
+      if (m < 0) { m = 11; y -= 1; }
+      s.calYear = y;
+      s.calMonth = m;
+      await render(cfg, s);
+      return true;
+    }
+    if (action === "n") {
+      m += 1;
+      if (m > 11) { m = 0; y += 1; }
+      s.calYear = y;
+      s.calMonth = m;
+      await render(cfg, s);
+      return true;
+    }
+    if (action === "t" || action === "tm") {
+      const iso = action === "t"
+        ? isoFromYMD(t.y, t.m, t.d)
+        : parseFriendlyDate("tomorrow");
+      if (iso) assignDate(s, field, iso);
+      resetCalendar(s);
+      await render(cfg, s);
+      return true;
+    }
+    if (action === "d") {
+      const iso = parts.slice(4).join(":");
+      if (iso && /^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+        assignDate(s, field, iso);
+        resetCalendar(s);
+        await render(cfg, s);
+      }
+      return true;
+    }
+    if (action === "cst") {
+      s.step = field === "d" ? "custom_due" : "custom_shoot";
+      resetCalendar(s);
+      s.messageId = undefined;
+      await sendMessageHtml(token, chatId, stepHeader(s.step, s.draft), keyboardFor(s));
+      touch(s);
+      return true;
+    }
     return true;
   }
 
@@ -565,6 +674,31 @@ export async function handleWizardCallback(
   return true; // consumed
 }
 
+/** Deterministic parser first (fast, free), AI fallback for fuzzy phrases. */
+async function resolveDate(raw: string): Promise<string | null> {
+  const direct = parseFriendlyDate(raw);
+  if (direct) return direct;
+  if (!aiEnabled()) return null;
+  const t = todayUTC();
+  return aiParseDate(raw, isoFromYMD(t.y, t.m, t.d));
+}
+
+function assignDate(s: Session, field: "d" | "s", iso: string) {
+  if (field === "d") {
+    s.draft.due = iso;
+    s.step = "priority";
+  } else {
+    s.draft.shoot = iso;
+    s.step = "review";
+  }
+}
+
+function resetCalendar(s: Session) {
+  s.calYear = undefined;
+  s.calMonth = undefined;
+  s.calField = undefined;
+}
+
 function advanceSkip(s: Session) {
   switch (s.step) {
     case "client":
@@ -585,26 +719,6 @@ function advanceSkip(s: Session) {
     default:
       break;
   }
-}
-
-function quickPickToIso(code: string): string | null {
-  switch (code) {
-    case "today":
-      return parseFriendlyDate("today");
-    case "tmr":
-      return parseFriendlyDate("tomorrow");
-    case "fri":
-      return parseFriendlyDate("fri");
-    case "nmon":
-      return parseFriendlyDate("next mon");
-    case "2d":
-      return parseFriendlyDate("+2d");
-    case "3d":
-      return parseFriendlyDate("+3d");
-    case "1w":
-      return parseFriendlyDate("+1w");
-  }
-  return null;
 }
 
 async function createFromDraft(cfg: BotConfig, s: Session): Promise<void> {

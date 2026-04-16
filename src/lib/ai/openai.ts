@@ -329,3 +329,57 @@ export async function routeIntent(userText: string): Promise<RouterIntent> {
   if (r.kind === "help") return { kind: "help" };
   return { kind: "smalltalk", reply: r.reply || "On it." };
 }
+
+// ── Date normalization ───────────────────────────────────────────────────────
+
+type DateResponse = { iso: string; confidence: number; note: string };
+
+const DATE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    iso: { type: "string" },
+    confidence: { type: "number" },
+    note: { type: "string" },
+  },
+  required: ["iso", "confidence", "note"],
+};
+
+/** Normalize any human date phrase into an ISO yyyy-mm-dd.
+ *  Returns null if the model is unsure or the input doesn't look like a date.
+ *  `todayISO` gives the LLM a stable reference so "tomorrow" / "friday" resolve
+ *  to the right week. */
+export async function aiParseDate(
+  input: string,
+  todayISO: string,
+): Promise<string | null> {
+  if (!aiEnabled()) return null;
+  const phrase = input.trim();
+  if (!phrase) return null;
+  try {
+    const system = [
+      `You normalize human date phrases to ISO yyyy-mm-dd.`,
+      `Use "${todayISO}" as today.`,
+      `Weekdays default to the upcoming one (if today is the weekday, return today).`,
+      `"next <weekday>" = the one in the following week (7+ days away).`,
+      `"end of month" = last day of the current month.`,
+      `"end of week" = the upcoming Sunday.`,
+      `Relative like "in 3 weeks", "+5d" are supported.`,
+      `If ambiguous or not a date, set iso="" and confidence=0.`,
+      `Return iso in yyyy-mm-dd only (no time). confidence 0..1. note: short reason.`,
+    ].join(" ");
+    const r = await chatJson<DateResponse>(
+      system,
+      `Phrase: """${phrase.replace(/"/g, '\\"')}"""`,
+      DATE_SCHEMA,
+      "date_normalize",
+    );
+    if (!r.iso) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(r.iso)) return null;
+    if (r.confidence < 0.5) return null;
+    return r.iso;
+  } catch (e) {
+    console.warn("[ai date]", (e as Error).message);
+    return null;
+  }
+}
