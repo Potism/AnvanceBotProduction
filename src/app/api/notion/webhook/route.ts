@@ -1,5 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { NextRequest } from "next/server";
+import { getBotConfig, isBotConfigured } from "@/lib/config";
+import { notifyFromNotionEvent } from "@/lib/bot/notify";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -82,8 +84,21 @@ export async function POST(req: NextRequest) {
   }
 
   if (parsed && typeof parsed === "object" && "type" in parsed) {
-    const t = (parsed as { type?: string }).type;
-    console.info("[notion webhook] event", t);
+    const evt = parsed as {
+      type?: string;
+      entity?: { id?: string; type?: string };
+      data?: { parent?: { id?: string; type?: string } };
+    };
+    const type = evt.type ?? "";
+    const pageId =
+      evt.entity?.type === "page" ? evt.entity?.id ?? "" : "";
+    console.info("[notion webhook] event", type, "page", pageId || "-");
+
+    if (pageId && type.startsWith("page.") && isBotConfigured()) {
+      notifyFromNotionEvent(getBotConfig(), type, pageId).catch((e) =>
+        console.warn("[notion webhook] notify failed", (e as Error).message),
+      );
+    }
   }
 
   return Response.json({ ok: true });

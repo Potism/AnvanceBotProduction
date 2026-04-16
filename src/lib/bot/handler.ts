@@ -1,17 +1,33 @@
 import { getBotConfig, isBotConfigured } from "../config";
 import { resolveTelegramAssigneeMap } from "../notion/assignee-map";
 import {
+  stampTelegramIdOnProductionForAssignee,
+  snoozeTaskDue,
+  updateTaskStatus,
+} from "../notion/actions";
+import {
   loadAssigneeLinkCatalog,
   matchAssigneeInput,
 } from "../notion/production-assignees";
+import {
+  fetchProductionTasks,
+  fetchTaskById,
+  searchProductionTasks,
+  type TaskRow,
+  type TaskView,
+} from "../notion/tasks";
 import { upsertTeamTelegramLink } from "../notion/team-link-upsert";
-import { fetchProductionTasks, type TaskView } from "../notion/tasks";
+import { tryHandleOpsCommand } from "./ops-commands";
+import { actionAckText } from "./notify";
 import {
   answerCallbackQuery,
+  editMessageTextHtml,
   mainMenuKeyboard,
   sendMessageHtml,
+  taskActionKeyboard,
 } from "../telegram/client";
 import {
+  formatTaskCard,
   formatTaskBlocks,
   headerLine,
   splitTelegramHtml,
@@ -21,17 +37,9 @@ import type { BotConfig } from "../types";
 
 type TelegramUser = { id: number; first_name?: string; username?: string };
 
-function resolveAssigneeNeedle(
-  telegramUserId: number,
-  map: Record<string, string>,
-): string | undefined {
-  const direct = map[String(telegramUserId)];
-  if (direct) return direct;
-  return undefined;
-}
-
 function detectViewFromText(text: string): TaskView | null {
   const t = text.toLowerCase();
+  if (t.includes("overdue") || t.includes("late")) return "overdue";
   if (
     t.includes("today") ||
     t.includes("this morning") ||
@@ -62,6 +70,73 @@ function viewTitle(view: TaskView): string {
       return "My queue";
     case "board":
       return "Team board";
+    case "overdue":
+      return "Overdue";
+  }
+}
+
+function restorePageId(short: string): string {
+  const s = short.replace(/-/g, "");
+  if (s.length !== 32) return short;
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+}
+
+async function sendView(
+  cfg: BotConfig,
+  chatId: number,
+  view: TaskView,
+  telegramUserId: number,
+  assigneeNeedle: string | undefined,
+): Promise<void> {
+  const token = cfg.telegramBotToken;
+  try {
+    const rows = await fetchProductionTasks(
+      cfg,
+      view,
+      assigneeNeedle,
+      telegramUserId,
+    );
+    if (rows.length === 0) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        `${headerLine(viewTitle(view))}\n\n<i>Nothing here. Enjoy the quiet.</i>`,
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+
+    const isPersonal = view === "mine" || view === "overdue";
+    if (isPersonal && rows.length <= 12) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        `${headerLine(viewTitle(view))} · <i>${rows.length} task${rows.length === 1 ? "" : "s"}</i>`,
+        mainMenuKeyboard(),
+      );
+      for (const r of rows) {
+        await sendMessageHtml(
+          token,
+          chatId,
+          formatTaskCard(r),
+          taskActionKeyboard(r.id, r.url),
+        );
+      }
+      return;
+    }
+
+    const body = `${headerLine(viewTitle(view))}\n\n${formatTaskBlocks(rows)}`;
+    for (const part of splitTelegramHtml(body)) {
+      await sendMessageHtml(token, chatId, part, mainMenuKeyboard());
+    }
+  } catch (e) {
+    console.error("[view]", view, e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Notion error</b>\nCheck database id, integration access, and property names in env.`,
+      mainMenuKeyboard(),
+    );
   }
 }
 
@@ -80,7 +155,6 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
         token,
         chatId,
         "<b>Server not fully configured</b>\nSet <code>NOTION_TOKEN</code>, <code>NOTION_DATABASE_ID</code>, and <code>TELEGRAM_BOT_TOKEN</code> on Vercel (Production), then redeploy.",
-        undefined,
       ).catch(() => {});
     } else {
       console.warn(
@@ -109,6 +183,7 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
 
   if (u.callback_query?.data && u.callback_query.message) {
     const chatId = u.callback_query.message.chat.id;
+    const messageId = u.callback_query.message.message_id;
     const fromId = u.callback_query.from.id;
     const data = u.callback_query.data;
 
@@ -134,34 +209,36 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
       return;
     }
 
+    if (data === "a:find") {
+      await answerCallbackQuery(token, u.callback_query.id);
+      await sendMessageHtml(
+        token,
+        chatId,
+        `<b>Find a task</b>\n\nType <code>/find &lt;keyword&gt;</code>\n\nExamples:\n<code>/find hotel</code>\n<code>/find APX reel</code>\n<code>/find changes</code>`,
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+
+    if (data.startsWith("t:")) {
+      await handleTaskActionCallback(
+        cfg,
+        token,
+        chatId,
+        messageId,
+        u.callback_query.id,
+        fromId,
+        data,
+      );
+      return;
+    }
+
     if (data.startsWith("v:")) {
       const view = data.slice(2) as TaskView;
-      if (!["today", "week", "mine", "board"].includes(view)) return;
+      if (!["today", "week", "mine", "board", "overdue"].includes(view)) return;
       await answerCallbackQuery(token, u.callback_query.id, "Pulling Notion…");
-      const needle = resolveAssigneeNeedle(fromId, assigneeMap);
-      if (view === "mine" && !needle) {
-        await sendMessageHtml(
-          token,
-          chatId,
-          mineWithoutMapMessage(fromId, notionTeamDir),
-          mainMenuKeyboard(),
-        );
-        return;
-      }
-      try {
-        const rows = await fetchProductionTasks(cfg, view, needle);
-        const body = `${headerLine(viewTitle(view))}\n\n${formatTaskBlocks(rows)}`;
-        for (const part of splitTelegramHtml(body)) {
-          await sendMessageHtml(token, chatId, part, mainMenuKeyboard());
-        }
-      } catch {
-        await sendMessageHtml(
-          token,
-          chatId,
-          `<b>Notion error</b>\nCheck database id, integration access, and property names in env.`,
-          mainMenuKeyboard(),
-        );
-      }
+      const needle = assigneeMap[String(fromId)];
+      await sendView(cfg, chatId, view, fromId, needle);
     }
     return;
   }
@@ -198,14 +275,18 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   const linkMatch = text.match(/^\/link(?:@\S*)?(?:\s+([\s\S]*))?$/i);
   if (linkMatch) {
     const nameArg = (linkMatch[1] ?? "").trim();
-    await handleLinkCommand(
-      cfg,
-      token,
-      chatId,
-      fromId,
-      nameArg,
-      notionTeamDir,
-    );
+    await handleLinkCommand(cfg, token, chatId, fromId, nameArg, notionTeamDir);
+    return;
+  }
+
+  const findMatch = text.match(/^\/find(?:@\S*)?(?:\s+([\s\S]*))?$/i);
+  if (findMatch) {
+    const q = (findMatch[1] ?? "").trim();
+    await handleFindCommand(cfg, chatId, q);
+    return;
+  }
+
+  if (await tryHandleOpsCommand(cfg, token, chatId, fromId, text)) {
     return;
   }
 
@@ -216,46 +297,140 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
         ? ("week" as const)
         : text.startsWith("/mine")
           ? ("mine" as const)
-          : text.startsWith("/board")
-            ? ("board" as const)
-            : null;
+          : text.startsWith("/overdue")
+            ? ("overdue" as const)
+            : text.startsWith("/board")
+              ? ("board" as const)
+              : null;
 
   const nlView = cmdView ?? detectViewFromText(text);
 
   if (nlView) {
-    const needle = resolveAssigneeNeedle(fromId, assigneeMap);
-    if (nlView === "mine" && !needle) {
-      await sendMessageHtml(
-        token,
-        chatId,
-        mineWithoutMapMessage(fromId, notionTeamDir),
-        mainMenuKeyboard(),
-      );
-      return;
-    }
-    try {
-      const rows = await fetchProductionTasks(cfg, nlView, needle);
-      const body = `${headerLine(viewTitle(nlView))}\n\n${formatTaskBlocks(rows)}`;
-      for (const part of splitTelegramHtml(body)) {
-        await sendMessageHtml(token, chatId, part, mainMenuKeyboard());
-      }
-    } catch {
-      await sendMessageHtml(
-        token,
-        chatId,
-        `<b>Notion error</b>\nCheck database id, integration access, and property names in env.`,
-        mainMenuKeyboard(),
-      );
-    }
+    const needle = assigneeMap[String(fromId)];
+    await sendView(cfg, chatId, nlView, fromId, needle);
     return;
   }
 
   await sendMessageHtml(
     token,
     chatId,
-    `Try <i>tasks due today</i> or tap a view below.\nNeed <b>My queue</b>? Use <code>/link</code> or <b>Link account</b>.`,
+    `Try <i>tasks due today</i> or tap a view below.\nSearch: <code>/find hotel</code>. Onboard: <code>/link</code>.`,
     mainMenuKeyboard(),
   );
+}
+
+async function handleTaskActionCallback(
+  cfg: BotConfig,
+  token: string,
+  chatId: number,
+  messageId: number,
+  callbackId: string,
+  fromId: number,
+  data: string,
+): Promise<void> {
+  const parts = data.split(":");
+  const action = parts[1];
+  const shortId = parts[2] ?? "";
+  if (!shortId) {
+    await answerCallbackQuery(token, callbackId, "Missing task id");
+    return;
+  }
+  const pageId = restorePageId(shortId);
+
+  await answerCallbackQuery(token, callbackId, "Working…");
+  try {
+    let updated: TaskRow | null = null;
+    let ackLabel = "";
+
+    if (action === "done") {
+      updated = await updateTaskStatus(cfg, pageId, "Approved");
+      ackLabel = "Marked approved";
+    } else if (action === "rev") {
+      updated = await updateTaskStatus(cfg, pageId, "Internal review");
+      ackLabel = "Sent to Internal review";
+    } else if (action === "snz") {
+      updated = await snoozeTaskDue(cfg, pageId, 1);
+      ackLabel = "Snoozed 1 day";
+    } else {
+      await sendMessageHtml(token, chatId, "Unknown action.");
+      return;
+    }
+
+    if (!updated) {
+      await sendMessageHtml(token, chatId, "Could not update this task.");
+      return;
+    }
+
+    await editMessageTextHtml(
+      token,
+      chatId,
+      messageId,
+      actionAckText(ackLabel, updated),
+      taskActionKeyboard(updated.id, updated.url),
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[task-action]", action, pageId, e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Action failed</b>\n<code>${esc(msg)}</code>\n\n` +
+        `If the status name doesn't exist in Notion, add options "Internal review" and "Approved", or rename via <code>NOTION_PROP_STATUS</code>.`,
+    );
+  }
+  // fromId reserved for future per-user permission checks on actions
+  void fromId;
+}
+
+async function handleFindCommand(
+  cfg: BotConfig,
+  chatId: number,
+  q: string,
+): Promise<void> {
+  const token = cfg.telegramBotToken;
+  if (!q) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Find a task</b>\n\n<code>/find hotel</code>\n<code>/find APX reel</code>\n<code>/find changes</code>`,
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+  try {
+    const rows = await searchProductionTasks(cfg, q, 8);
+    if (rows.length === 0) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        `No open tasks matched <b>${esc(q)}</b>.`,
+        mainMenuKeyboard(),
+      );
+      return;
+    }
+    await sendMessageHtml(
+      token,
+      chatId,
+      `${headerLine("Find")} · <i>${rows.length} match${rows.length === 1 ? "" : "es"} for “${esc(q)}”</i>`,
+      mainMenuKeyboard(),
+    );
+    for (const r of rows) {
+      await sendMessageHtml(
+        token,
+        chatId,
+        formatTaskCard(r),
+        taskActionKeyboard(r.id, r.url),
+      );
+    }
+  } catch (e) {
+    console.error("[find]", e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Search failed</b>\nCheck Notion access and property names.`,
+      mainMenuKeyboard(),
+    );
+  }
 }
 
 function welcomeMessage(
@@ -265,25 +440,10 @@ function welcomeMessage(
 ): string {
   const linked = Boolean(map[String(telegramUserId)]);
   const linkHint = linked
-    ? "You are set up for <b>My queue</b>."
-    : notionTeamDir
-      ? `Tap <b>Link account</b> or <code>/link</code> with your <b>Assignee</b> name or workspace <b>email</b> (see /help).`
-      : `For <b>My queue</b>, ops can enable the team link database or add you via <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel.`;
-  return `<b>Anvance Production</b>\n<i>Notion task desk</i>\n\n${linkHint}\n\nUse the keyboard or type naturally — e.g. <i>tasks due today</i>.`;
-}
-
-function mineWithoutMapMessage(
-  telegramUserId: number,
-  notionTeamDir: boolean,
-): string {
-  const tgCol =
-    process.env.NOTION_TEAM_LINK_TELEGRAM_PROP?.trim() || "Telegram user id";
-  const assigneeCol =
-    process.env.NOTION_TEAM_LINK_ASSIGNEE_PROP?.trim() || "Notion assignee";
-  const notionLine = notionTeamDir
-    ? `\n\n<b>Self-service:</b> <code>/link Your full Notion assignee name</code> (same as Production).\n\n<b>Or</b> ask ops to add a row: <code>${tgCol}</code> = <code>${telegramUserId}</code>, <code>${assigneeCol}</code> or page title = assignee name. Wait ~1 min after changes (cache).`
-    : "";
-  return `<b>My queue</b> needs an assignee link.${notionLine}\n\n<b>Ops-only fallback</b> — <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel:\n<code>{"${telegramUserId}":"Your Name In Notion"}</code>`;
+    ? "You're linked for <b>My queue</b>."
+    : "Tap <b>🔗 Link account</b> or run <code>/link Your Name</code> to see your queue instantly.";
+  void notionTeamDir;
+  return `<b>Anvance Production</b>\n<i>Telegram · Notion task desk</i>\n\n${linkHint}\n\n<b>Do it fast</b>\n• <code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code>\n• <code>/find hotel</code> — search any task\n• Tap a task card to <b>Review</b>, <b>Done</b>, or <b>Snooze</b>.`;
 }
 
 function helpMessage(
@@ -293,9 +453,9 @@ function helpMessage(
   const idLine = `Your Telegram user id: <code>${telegramUserId}</code>`;
   const mapLine =
     Object.keys(map).length === 0
-      ? "No assignee links loaded yet."
+      ? "No assignee links loaded (using Production's Telegram id column directly)."
       : `Assignee links on file: <b>${Object.keys(map).length}</b>`;
-  return `${idLine}\n${mapLine}\n\n<b>Shortcuts</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/board</code>\n<code>/link</code> — connect Telegram ↔ Notion assignee\n<code>/start</code> · <code>/help</code>\n\n<b>Natural language</b>\n<i>What are my tasks today?</i> · <i>this week</i> · <i>team board</i>`;
+  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code> · <code>/board</code>\n<code>/find &lt;keyword&gt;</code> — search tasks\n<code>/link Your Name</code> — stamp Telegram id on your Production rows\n<code>/start</code> · <code>/help</code>\n\n<b>On a task card</b>\n• 🔗 Open in Notion\n• 🔍 Review → Internal review\n• ✅ Done → Approved\n• ⏰ Snooze 1d → bumps Due\n\n<b>Ops</b> (managers, if enabled): <code>/ops help</code>\n\n<b>Natural language</b>\n<i>what are my tasks today</i> · <i>this week</i> · <i>team board</i> · <i>overdue</i>`;
 }
 
 function esc(s: string): string {
@@ -308,25 +468,19 @@ function esc(s: string): string {
 function linkInstructionsHtml(): string {
   return `<b>Link your Telegram account</b>
 
-For <b>My queue</b>, send either:
+Tell me who you are in Notion:
 
-• <b>Name</b> — as shown on tasks (text assignee, or each person’s name when Assignee is <b>People</b>)
-• <b>Work email</b> — same email Notion has for you in the workspace (if the integration can read it)
+• <b>Name</b> — the exact Assignee text on tasks
+• <b>Work email</b> — same email Notion has for you (when visible to the integration)
 
 <code>/link Albert Rhey Embalsado</code>
 <code>/link you@company.com</code>
 
-We match open Production tasks. If several names match, use a fuller name.`;
+I'll stamp your Telegram id onto your open Production tasks so <b>/mine</b> just works.`;
 }
 
-function linkDisabledNoDbHtml(): string {
-  return `<b>Self-service link is off</b>
-
-Ask ops to set <code>NOTION_TEAM_LINK_DATABASE_ID</code> in Vercel (team directory database shared with the integration), redeploy, then try <code>/link</code> again.`;
-}
-
-function linkNoAssigneesInProductionHtml(): string {
-  return `<b>No assignee names found</b> on open tasks in Production.
+function linkNoAssigneesHtml(): string {
+  return `<b>No assignees found</b> on open Production tasks.
 
 Add at least one task with an <b>Assignee</b>, then try <code>/link</code> again.`;
 }
@@ -360,23 +514,25 @@ ${lines}`;
 function linkSuccessHtml(
   assignee: string,
   mode: "exact" | "unique_partial" | "email",
+  updated: number,
+  skipped: number,
 ): string {
   const note =
     mode === "unique_partial"
-      ? "\n<i>Matched from a partial name — you can re-link with the full name anytime.</i>"
+      ? "\n<i>Matched from a partial name — re-run <code>/link</code> with the full name anytime.</i>"
       : mode === "email"
         ? "\n<i>Matched by workspace email from Notion.</i>"
         : "";
-  return `<b>Linked</b>
+  return `<b>Linked ✅</b>
 
-Your Telegram is mapped to:
 <code>${esc(assignee)}</code>
+Updated <b>${updated}</b> open task${updated === 1 ? "" : "s"} (skipped ${skipped}).
 
-Open <b>My queue</b> when you are ready.${note}`;
+Open <b>/mine</b> when ready.${note}`;
 }
 
 function linkErrorHtml(message: string): string {
-  return `<b>Could not save link</b>\n\n<code>${esc(message)}</code>\n\nIf the team link database has extra <i>required</i> columns, add defaults or make them optional in Notion.`;
+  return `<b>Could not save link</b>\n\n<code>${esc(message)}</code>\n\nCheck that Production has a Telegram id column (default <code>Telegram user id</code>) and the integration has edit access.`;
 }
 
 async function handleLinkCommand(
@@ -387,15 +543,6 @@ async function handleLinkCommand(
   nameArg: string,
   notionTeamDir: boolean,
 ): Promise<void> {
-  if (!notionTeamDir) {
-    await sendMessageHtml(
-      token,
-      chatId,
-      linkDisabledNoDbHtml(),
-      mainMenuKeyboard(),
-    );
-    return;
-  }
   if (!nameArg) {
     await sendMessageHtml(
       token,
@@ -411,7 +558,7 @@ async function handleLinkCommand(
       await sendMessageHtml(
         token,
         chatId,
-        linkNoAssigneesInProductionHtml(),
+        linkNoAssigneesHtml(),
         mainMenuKeyboard(),
       );
       return;
@@ -426,11 +573,28 @@ async function handleLinkCommand(
       );
       return;
     }
-    await upsertTeamTelegramLink(cfg, fromId, match.assignee);
+
+    const { updated, skipped } = await stampTelegramIdOnProductionForAssignee(
+      cfg,
+      fromId,
+      match.assignee,
+    );
+
+    if (notionTeamDir) {
+      try {
+        await upsertTeamTelegramLink(cfg, fromId, match.assignee);
+      } catch (e) {
+        console.warn(
+          "[link] team-link mirror upsert failed (non-fatal)",
+          (e as Error).message,
+        );
+      }
+    }
+
     await sendMessageHtml(
       token,
       chatId,
-      linkSuccessHtml(match.assignee, match.mode),
+      linkSuccessHtml(match.assignee, match.mode, updated, skipped),
       mainMenuKeyboard(),
     );
   } catch (e) {

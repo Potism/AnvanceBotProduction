@@ -96,3 +96,25 @@ export function firstTitleOnPage(page: PageObjectResponse): string {
   }
   return "";
 }
+
+/** Telegram id column can be Number, Rich text, or Title — coerce to positive int. */
+export function propertyAsTelegramId(
+  page: PageObjectResponse,
+  propName: string,
+): number | null {
+  const p = page.properties[propName];
+  if (!p) return null;
+  if (p.type === "number" && typeof p.number === "number") {
+    return Number.isFinite(p.number) && p.number > 0 ? Math.trunc(p.number) : null;
+  }
+  const raw = propertyAsString(page, propName).replace(/\s/g, "");
+  if (!/^\d{3,}$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Public Notion URL for a page, falls back to an `id`-based share URL. */
+export function pageShareUrl(page: PageObjectResponse): string {
+  if (typeof page.url === "string" && page.url) return page.url;
+  return `https://www.notion.so/${page.id.replace(/-/g, "")}`;
+}

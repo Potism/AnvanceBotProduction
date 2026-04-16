@@ -1,7 +1,11 @@
 import { Client } from "@notionhq/client";
-import type { DatabaseObjectResponse } from "@notionhq/client/build/src/api-endpoints";
+import type {
+  DatabaseObjectResponse,
+  PageObjectResponse,
+} from "@notionhq/client/build/src/api-endpoints";
 import type { BotConfig } from "../types";
 import { clearAssigneeMapCache } from "./assignee-map";
+import { firstTitleOnPage, propertyAsString } from "./props";
 
 type PropSchema = DatabaseObjectResponse["properties"][string];
 
@@ -78,11 +82,18 @@ export async function upsertTeamTelegramLink(
   const schema = db.properties;
   const tgSch = schema[tgProp];
   const asgSch = schema[assigneeProp];
+  const propList = Object.keys(schema).sort().join(", ");
   if (!tgSch) {
-    throw new Error(`Team link database has no property named "${tgProp}".`);
+    throw new Error(
+      `No property "${tgProp}". This database has: ${propList}. ` +
+        `In Vercel set NOTION_TEAM_LINK_TELEGRAM_PROP to your Telegram id column name (exact match, case-sensitive).`,
+    );
   }
   if (!asgSch) {
-    throw new Error(`Team link database has no property named "${assigneeProp}".`);
+    throw new Error(
+      `No property "${assigneeProp}". This database has: ${propList}. ` +
+        `Set NOTION_TEAM_LINK_ASSIGNEE_PROP to your assignee/name column, or add that column.`,
+    );
   }
 
   const filt = filterForTelegramId(tgProp, tgSch, telegramUserId);
@@ -113,4 +124,72 @@ export async function upsertTeamTelegramLink(
   }
 
   clearAssigneeMapCache();
+}
+
+export type TeamLinkRowPreview = { telegram: string; assignee: string };
+
+function teamLinkPropNames(): { dbId: string; tgProp: string; assigneeProp: string } {
+  const dbId = process.env.NOTION_TEAM_LINK_DATABASE_ID?.trim() ?? "";
+  const tgProp =
+    process.env.NOTION_TEAM_LINK_TELEGRAM_PROP?.trim() || "Telegram user id";
+  const assigneeProp =
+    process.env.NOTION_TEAM_LINK_ASSIGNEE_PROP?.trim() || "Notion assignee";
+  return { dbId, tgProp, assigneeProp };
+}
+
+function assigneeCell(page: PageObjectResponse, assigneeProp: string): string {
+  return (
+    propertyAsString(page, assigneeProp).trim() ||
+    firstTitleOnPage(page).trim() ||
+    "—"
+  );
+}
+
+/** Recent rows in the team link database (for /ops team). */
+export async function listTeamLinkRowPreviews(
+  cfg: BotConfig,
+  limit: number,
+): Promise<TeamLinkRowPreview[]> {
+  const { dbId, tgProp, assigneeProp } = teamLinkPropNames();
+  if (!dbId) return [];
+  const client = new Client({ auth: cfg.notionToken });
+  const res = await client.databases.query({
+    database_id: dbId,
+    page_size: Math.min(100, Math.max(1, limit)),
+  });
+  const out: TeamLinkRowPreview[] = [];
+  for (const r of res.results) {
+    if (!("properties" in r)) continue;
+    const page = r as PageObjectResponse;
+    const tg = propertyAsString(page, tgProp).replace(/\s/g, "") || "—";
+    out.push({ telegram: tg, assignee: assigneeCell(page, assigneeProp) });
+  }
+  return out;
+}
+
+/** Resolve assignee string for a Telegram id from the team link DB, if any. */
+export async function findTeamLinkAssigneeForTg(
+  cfg: BotConfig,
+  telegramUserId: number,
+): Promise<string | null> {
+  const { dbId, tgProp, assigneeProp } = teamLinkPropNames();
+  if (!dbId) return null;
+  const client = new Client({ auth: cfg.notionToken });
+  const db = (await client.databases.retrieve({
+    database_id: dbId,
+  })) as DatabaseObjectResponse;
+  const schema = db.properties;
+  const tgSch = schema[tgProp];
+  if (!tgSch) return null;
+  const filt = filterForTelegramId(tgProp, tgSch, telegramUserId);
+  const existing = await client.databases.query({
+    database_id: dbId,
+    filter: filt as never,
+    page_size: 3,
+  });
+  const first = existing.results[0];
+  if (!first || !("properties" in first)) return null;
+  const page = first as PageObjectResponse;
+  const a = assigneeCell(page, assigneeProp);
+  return a === "—" ? null : a;
 }

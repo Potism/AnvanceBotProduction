@@ -36,6 +36,9 @@ export function getBotConfig() {
       deliverable: process.env.NOTION_PROP_DELIVERABLE ?? "Deliverable",
       client: process.env.NOTION_PROP_CLIENT ?? "Client",
       serviceLine: process.env.NOTION_PROP_SERVICE_LINE ?? "Service line",
+      telegramUserId:
+        process.env.NOTION_PROP_TELEGRAM_USER_ID ?? "Telegram user id",
+      reviewer: process.env.NOTION_PROP_REVIEWER ?? "Reviewer",
     },
     telegramUserAssignees: parseUserAssigneeMap(process.env.TELEGRAM_USER_ASSIGNEE_MAP),
   };

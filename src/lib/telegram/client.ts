@@ -1,10 +1,10 @@
-type InlineKeyboardButton = {
+export type InlineKeyboardButton = {
   text: string;
   callback_data?: string;
   url?: string;
 };
 
-type ReplyMarkup = {
+export type ReplyMarkup = {
   inline_keyboard: InlineKeyboardButton[][];
 };
 
@@ -63,19 +63,83 @@ export async function answerCallbackQuery(
   });
 }
 
+export async function editMessageReplyMarkup(
+  token: string,
+  chatId: number,
+  messageId: number,
+  replyMarkup: ReplyMarkup,
+): Promise<void> {
+  try {
+    await tgApi(token, "editMessageReplyMarkup", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+export async function editMessageTextHtml(
+  token: string,
+  chatId: number,
+  messageId: number,
+  text: string,
+  replyMarkup?: ReplyMarkup,
+): Promise<void> {
+  try {
+    await tgApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function mainMenuKeyboard(): ReplyMarkup {
   return {
     inline_keyboard: [
       [
-        { text: "Today", callback_data: "v:today" },
-        { text: "This week", callback_data: "v:week" },
+        { text: "📅 Today", callback_data: "v:today" },
+        { text: "🗓 This week", callback_data: "v:week" },
       ],
       [
-        { text: "My queue", callback_data: "v:mine" },
-        { text: "Team board", callback_data: "v:board" },
+        { text: "👤 My queue", callback_data: "v:mine" },
+        { text: "🧭 Team board", callback_data: "v:board" },
       ],
-      [{ text: "Link account", callback_data: "a:link" }],
-      [{ text: "Help", callback_data: "v:help" }],
+      [
+        { text: "⏰ Overdue", callback_data: "v:overdue" },
+        { text: "🔎 Find", callback_data: "a:find" },
+      ],
+      [
+        { text: "🔗 Link account", callback_data: "a:link" },
+        { text: "❔ Help", callback_data: "v:help" },
+      ],
+    ],
+  };
+}
+
+/** Per-task action row: Open Notion / Review / Done / Snooze 1d. */
+export function taskActionKeyboard(
+  pageId: string,
+  url: string,
+): ReplyMarkup {
+  const id = pageId.replace(/-/g, "");
+  return {
+    inline_keyboard: [
+      [
+        { text: "🔗 Open in Notion", url },
+        { text: "🔍 Review", callback_data: `t:rev:${id}` },
+      ],
+      [
+        { text: "✅ Done", callback_data: `t:done:${id}` },
+        { text: "⏰ Snooze 1d", callback_data: `t:snz:${id}` },
+      ],
     ],
   };
 }

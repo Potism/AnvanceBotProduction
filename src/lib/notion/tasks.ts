@@ -1,6 +1,11 @@
 import { Client } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client/build/src/api-endpoints";
-import { pageTitle, propertyAsString } from "./props";
+import {
+  pageShareUrl,
+  pageTitle,
+  propertyAsString,
+  propertyAsTelegramId,
+} from "./props";
 import type { BotConfig } from "../types";
 
 function startOfDay(d: Date): string {
@@ -19,12 +24,14 @@ function parseISODate(s: string | undefined): string | null {
   return m ? m[1] : null;
 }
 
-export type TaskView = "today" | "week" | "mine" | "board";
+export type TaskView = "today" | "week" | "mine" | "board" | "overdue";
 
 export type TaskRow = {
   id: string;
+  url: string;
   title: string;
   assignee: string;
+  telegramUserId: number | null;
   due: string;
   shoot: string;
   status: string;
@@ -32,14 +39,28 @@ export type TaskRow = {
   deliverable: string;
   client: string;
   serviceLine: string;
+  reviewer: string;
 };
 
-function toRow(page: PageObjectResponse, cfg: BotConfig): TaskRow {
+/** Statuses we treat as closed (hidden from My queue, digest, overdue). */
+export const DONE_STATUSES = new Set<string>(
+  ["done", "approved", "shipped", "cancelled", "canceled", "scheduled", "archived"].map(
+    (s) => s.toLowerCase(),
+  ),
+);
+
+export function isTaskDone(status: string): boolean {
+  return DONE_STATUSES.has(status.trim().toLowerCase());
+}
+
+export function toTaskRow(page: PageObjectResponse, cfg: BotConfig): TaskRow {
   const props = cfg.notionProps;
   return {
     id: page.id,
-    title: pageTitle(page, props.name),
+    url: pageShareUrl(page),
+    title: pageTitle(page, props.name) || "Untitled",
     assignee: propertyAsString(page, props.assignee),
+    telegramUserId: propertyAsTelegramId(page, props.telegramUserId),
     due: propertyAsString(page, props.due),
     shoot: propertyAsString(page, props.shoot),
     status: propertyAsString(page, props.status),
@@ -47,6 +68,7 @@ function toRow(page: PageObjectResponse, cfg: BotConfig): TaskRow {
     deliverable: propertyAsString(page, props.deliverable),
     client: propertyAsString(page, props.client),
     serviceLine: propertyAsString(page, props.serviceLine),
+    reviewer: propertyAsString(page, props.reviewer),
   };
 }
 
@@ -58,7 +80,7 @@ function matchesAssignee(row: TaskRow, needle: string | undefined): boolean {
   return hay.includes(h) || h.includes(hay);
 }
 
-/** Raw pages from Production for a view (before assignee / status filters on rows). */
+/** Raw pages from Production for a view (before row-level filters). */
 export async function fetchProductionPages(
   cfg: BotConfig,
   view: TaskView,
@@ -81,14 +103,8 @@ export async function fetchProductionPages(
     if (view === "today") {
       body.filter = {
         or: [
-          {
-            property: props.due,
-            date: { equals: today },
-          },
-          {
-            property: props.shoot,
-            date: { equals: today },
-          },
+          { property: props.due, date: { equals: today } },
+          { property: props.shoot, date: { equals: today } },
         ],
       };
     } else if (view === "week") {
@@ -108,6 +124,11 @@ export async function fetchProductionPages(
           },
         ],
       };
+    } else if (view === "overdue") {
+      body.filter = {
+        property: props.due,
+        date: { before: today },
+      };
     }
 
     const res = await client.databases.query(body);
@@ -124,36 +145,94 @@ export async function fetchProductionTasks(
   cfg: BotConfig,
   view: TaskView,
   assigneeNeedle: string | undefined,
+  telegramUserId?: number,
 ): Promise<TaskRow[]> {
   const responses = await fetchProductionPages(cfg, view);
 
-  let rows = responses.map((p) => toRow(p, cfg));
+  let rows = responses.map((p) => toTaskRow(p, cfg));
 
   if (view === "today" || view === "week") {
-    rows = rows.filter((row) => matchesAssignee(row, assigneeNeedle));
+    rows = rows.filter((row) => {
+      if (telegramUserId && row.telegramUserId === telegramUserId) return true;
+      return matchesAssignee(row, assigneeNeedle);
+    });
   } else if (view === "mine") {
-    rows = rows.filter((row) => matchesAssignee(row, assigneeNeedle));
-    const statusDone = new Set(
-      ["done", "approved", "shipped", "cancelled", "canceled"].map((s) =>
-        s.toLowerCase(),
-      ),
-    );
-    rows = rows.filter((row) => !statusDone.has(row.status.toLowerCase()));
+    rows = rows.filter((row) => {
+      const tgMatch = telegramUserId && row.telegramUserId === telegramUserId;
+      const nameMatch = matchesAssignee(row, assigneeNeedle);
+      return Boolean(tgMatch) || (!telegramUserId && nameMatch);
+    });
+    rows = rows.filter((row) => !isTaskDone(row.status));
+  } else if (view === "overdue") {
+    rows = rows.filter((row) => !isTaskDone(row.status));
+    if (telegramUserId) {
+      rows = rows.filter(
+        (row) =>
+          row.telegramUserId === telegramUserId ||
+          matchesAssignee(row, assigneeNeedle),
+      );
+    }
   }
 
-  if (view === "today" || view === "week") {
-    rows.sort((a, b) => {
-      const da = parseISODate(a.due) ?? parseISODate(a.shoot) ?? "";
-      const db = parseISODate(b.due) ?? parseISODate(b.shoot) ?? "";
-      return da.localeCompare(db);
-    });
-  } else {
-    rows.sort((a, b) => {
-      const da = parseISODate(a.due) ?? "";
-      const db = parseISODate(b.due) ?? "";
-      return da.localeCompare(db);
-    });
-  }
+  rows.sort((a, b) => {
+    const da = parseISODate(a.due) ?? parseISODate(a.shoot) ?? "";
+    const db = parseISODate(b.due) ?? parseISODate(b.shoot) ?? "";
+    if (da && db) return da.localeCompare(db);
+    if (da) return -1;
+    if (db) return 1;
+    return a.title.localeCompare(b.title);
+  });
 
   return rows;
+}
+
+/** Full-text-ish search over open tasks in Production. */
+export async function searchProductionTasks(
+  cfg: BotConfig,
+  query: string,
+  limit = 10,
+): Promise<TaskRow[]> {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const pages = await fetchProductionPages(cfg, "board");
+  const rows = pages.map((p) => toTaskRow(p, cfg));
+  const scored = rows
+    .map((r) => {
+      const hay = [
+        r.title,
+        r.client,
+        r.deliverable,
+        r.assignee,
+        r.status,
+        r.serviceLine,
+        r.priority,
+      ]
+        .join(" ")
+        .toLowerCase();
+      let score = 0;
+      if (r.title.toLowerCase().includes(q)) score += 3;
+      if (hay.includes(q)) score += 1;
+      return { r, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.r);
+  return scored;
+}
+
+/** Retrieve a single page as a TaskRow (for action callbacks and notifications). */
+export async function fetchTaskById(
+  cfg: BotConfig,
+  pageId: string,
+): Promise<TaskRow | null> {
+  try {
+    const client = new Client({ auth: cfg.notionToken });
+    const page = (await client.pages.retrieve({
+      page_id: pageId,
+    })) as PageObjectResponse;
+    return toTaskRow(page, cfg);
+  } catch {
+    return null;
+  }
 }

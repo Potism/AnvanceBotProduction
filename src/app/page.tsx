@@ -10,12 +10,24 @@ const envRows = [
   ["TELEGRAM_BOT_TOKEN", "From BotFather"],
   ["NEXT_PUBLIC_APP_URL", "Public site URL for webhooks"],
   ["TELEGRAM_WEBHOOK_SECRET", "Optional; must match Telegram secret header"],
-  ["TELEGRAM_USER_ASSIGNEE_MAP", "Small teams: JSON Telegram id → Notion assignee name"],
+  [
+    "NOTION_PROP_TELEGRAM_USER_ID",
+    "Telegram id column on Production (default: \"Telegram user id\"). Source of truth for /mine.",
+  ],
+  [
+    "TELEGRAM_USER_ASSIGNEE_MAP",
+    "Optional; JSON Telegram id → assignee name (fallback for people who haven't run /link)",
+  ],
   [
     "NOTION_TEAM_LINK_DATABASE_ID",
-    "Optional; Notion DB id — one row per person (Telegram id + assignee name); scales for large teams",
+    "Optional; directory DB mirrored on /link (for ops lookups, not required for /mine)",
   ],
-  ["ADMIN_SETUP_SECRET", "Protects the set-webhook helper route"],
+  ["ADMIN_SETUP_SECRET", "Protects the set-webhook + digest helper routes"],
+  ["CRON_SECRET", "Set by Vercel Cron automatically; also usable for manual runs"],
+  [
+    "TELEGRAM_OPS_USER_IDS",
+    "Optional; JSON array of Telegram numeric ids allowed to run /ops",
+  ],
 ];
 
 export default function Home() {
@@ -96,11 +108,11 @@ export default function Home() {
                   4
                 </span>
                 <span>
-                  Optional team scale: set{" "}
-                  <code className="text-[11px]">NOTION_TEAM_LINK_DATABASE_ID</code>{" "}
-                  for a small Notion directory DB; teammates run{" "}
-                  <code className="text-[11px]">/link</code> in Telegram (no env
-                  JSON per person).
+                  Team self-onboards: each teammate runs{" "}
+                  <code className="text-[11px]">/link Your Name</code> once.
+                  The bot stamps their Telegram id on their Production rows, so{" "}
+                  <code className="text-[11px]">/mine</code>, digests, and push
+                  notifications all work without editing env JSON.
                 </span>
               </li>
             </ul>
@@ -170,35 +182,51 @@ export default function Home() {
               </span>{" "}
               route to the same engine as slash commands.
             </p>
-            <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              {["/today", "/week", "/mine", "/board", "/link", "/help"].map(
-                (cmd) => (
-                  <div
-                    key={cmd}
-                    className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-zinc-200"
-                  >
-                    {cmd}
-                  </div>
-                ),
-              )}
+            <div className="mt-5 grid gap-3 sm:grid-cols-3">
+              {[
+                "/today",
+                "/week",
+                "/mine",
+                "/overdue",
+                "/board",
+                "/find",
+                "/link",
+                "/ops",
+                "/help",
+              ].map((cmd) => (
+                <div
+                  key={cmd}
+                  className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-zinc-200"
+                >
+                  {cmd}
+                </div>
+              ))}
             </div>
+            <p className="mt-4 text-xs leading-relaxed text-zinc-500">
+              Each task card has inline actions — <b>Open in Notion</b>,{" "}
+              <b>Review</b>, <b>Done</b>, <b>Snooze 1d</b>. Morning digest
+              runs weekdays at 07:00 UTC via Vercel Cron. Notion webhooks DM the
+              assignee on new tasks and hot status changes.
+            </p>
           </div>
 
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-6">
             <h2 className="text-sm font-semibold text-white">Notion fields</h2>
             <p className="mt-3 text-sm leading-relaxed text-zinc-400">
               Defaults follow your CSV export: Name, Assignee, Due date, Shoot
-              / live date, Status, Priority, Deliverable, Client, Service line.
-              Rename in Notion? Mirror with{" "}
+              / live date, Status, Priority, Deliverable, Client, Service line,
+              Reviewer, <b>Telegram user id</b>. Rename in Notion? Mirror with{" "}
               <code className="rounded-md bg-black/40 px-1.5 py-0.5 text-[11px]">
                 NOTION_PROP_*
               </code>{" "}
               variables.
             </p>
             <div className="mt-5 rounded-xl border border-dashed border-white/15 bg-black/25 p-4 text-xs text-zinc-400">
-              My queue hides Done-like statuses and matches your assignee label
-              from the map. Team board shows the full database window without
-              assignee filtering.
+              <b>My queue</b> = Production rows where{" "}
+              <code className="text-[11px]">Telegram user id</code> equals the
+              caller. <b>/link</b> writes that column on your open rows so
+              onboarding is self-service. Inline actions (<b>Review</b>,{" "}
+              <b>Done</b>, <b>Snooze</b>) write back to Notion immediately.
             </div>
           </div>
         </section>
