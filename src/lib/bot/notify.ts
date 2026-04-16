@@ -156,3 +156,43 @@ export async function sendMorningDigest(cfg: BotConfig): Promise<{
 export function actionAckText(action: string, row: TaskRow): string {
   return `✅ <b>${escapeHtml(action)}</b>\n\n${formatTaskCard(row)}`;
 }
+
+/** Parse TELEGRAM_SOCIAL_MANAGER_IDS as JSON array or comma/space list. */
+export function parseSocialManagerIds(): number[] {
+  const raw = process.env.TELEGRAM_SOCIAL_MANAGER_IDS?.trim();
+  if (!raw) return [];
+  try {
+    const j = JSON.parse(raw) as unknown;
+    if (Array.isArray(j)) {
+      return j
+        .map((x) => (typeof x === "number" ? x : Number(String(x))))
+        .filter((n) => Number.isFinite(n) && n > 0) as number[];
+    }
+  } catch {
+    /* fall through */
+  }
+  return raw
+    .split(/[\s,]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+/** DM all configured social managers with a task card. */
+export async function dmSocialManagers(
+  cfg: BotConfig,
+  heading: string,
+  row: TaskRow,
+): Promise<number> {
+  const ids = parseSocialManagerIds();
+  if (ids.length === 0) return 0;
+  let sent = 0;
+  for (const id of ids) {
+    try {
+      await dmTaskCard(cfg, id, heading, row);
+      sent += 1;
+    } catch {
+      /* continue */
+    }
+  }
+  return sent;
+}

@@ -137,9 +137,10 @@ export function taskActionKeyboard(
         { text: "🔍 Review", callback_data: `t:rev:${id}` },
       ],
       [
+        { text: "✈️ Send to client", callback_data: `t:cappr:${id}` },
         { text: "✅ Done", callback_data: `t:done:${id}` },
-        { text: "⏰ Snooze 1d", callback_data: `t:snz:${id}` },
       ],
+      [{ text: "⏰ Snooze 1d", callback_data: `t:snz:${id}` }],
     ],
   };
 }

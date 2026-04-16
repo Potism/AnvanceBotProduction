@@ -223,3 +223,233 @@ export async function fetchStatusOptionNames(
   }
   return [];
 }
+
+/** Forward lookup: assignee display for a Telegram id (first open row wins). */
+export async function findAssigneeForTelegramId(
+  cfg: BotConfig,
+  telegramUserId: number,
+): Promise<string | null> {
+  const pages = await fetchProductionPages(cfg, "board");
+  for (const p of pages) {
+    const row = toTaskRow(p, cfg);
+    if (row.telegramUserId === telegramUserId && row.assignee) {
+      return row.assignee;
+    }
+  }
+  return null;
+}
+
+/**
+ * Send a task for client approval:
+ *   - sets "Client approval" = "Sent" (when that column exists as select)
+ *   - optionally advances Status (default: "Client review" if the option exists)
+ * Returns the updated row.
+ */
+export async function sendTaskForClientApproval(
+  cfg: BotConfig,
+  pageId: string,
+): Promise<TaskRow | null> {
+  const schema = (await getDatabaseSchema(cfg)).properties;
+  const clientApprovalProp =
+    process.env.NOTION_PROP_CLIENT_APPROVAL?.trim() || "Client approval";
+  const sentValue =
+    process.env.NOTION_CLIENT_APPROVAL_SENT_VALUE?.trim() || "Sent";
+  const targetStatus =
+    process.env.NOTION_STATUS_CLIENT_REVIEW?.trim() || "Client review";
+
+  const properties: Record<string, unknown> = {};
+
+  const caSch = schema[clientApprovalProp];
+  if (caSch) {
+    if (caSch.type === "select") {
+      properties[clientApprovalProp] = { select: { name: sentValue } };
+    } else if (caSch.type === "status") {
+      properties[clientApprovalProp] = { status: { name: sentValue } };
+    } else if (caSch.type === "rich_text") {
+      properties[clientApprovalProp] = {
+        rich_text: [{ type: "text", text: { content: sentValue } }],
+      };
+    }
+  }
+
+  const statusSch = schema[cfg.notionProps.status];
+  const statusOptionAvailable = (() => {
+    if (!statusSch) return false;
+    if (statusSch.type === "status") {
+      return Boolean(
+        statusSch.status?.options?.some((o) => o.name === targetStatus),
+      );
+    }
+    if (statusSch.type === "select") {
+      return Boolean(
+        statusSch.select?.options?.some((o) => o.name === targetStatus),
+      );
+    }
+    return false;
+  })();
+  if (statusSch && statusOptionAvailable) {
+    if (statusSch.type === "status") {
+      properties[cfg.notionProps.status] = { status: { name: targetStatus } };
+    } else if (statusSch.type === "select") {
+      properties[cfg.notionProps.status] = { select: { name: targetStatus } };
+    }
+  }
+
+  if (Object.keys(properties).length === 0) {
+    throw new Error(
+      `No writable "${clientApprovalProp}" column found. Add it as Select with a "${sentValue}" option, or rename via NOTION_PROP_CLIENT_APPROVAL / NOTION_CLIENT_APPROVAL_SENT_VALUE.`,
+    );
+  }
+
+  const client = new Client({ auth: cfg.notionToken });
+  const updated = (await client.pages.update({
+    page_id: pageId,
+    properties: properties as never,
+  })) as PageObjectResponse;
+  return toTaskRow(updated, cfg);
+}
+
+// ── /new: quick task creation ───────────────────────────────────────────────
+
+export type NewTaskInput = {
+  title: string;
+  client?: string;
+  deliverable?: string;
+  serviceLine?: string;
+  priority?: string;
+  status?: string;
+  due?: string;
+  shoot?: string;
+  assignee?: string;
+  telegramUserId?: number;
+};
+
+function richTextValue(v: string): Record<string, unknown> {
+  return { rich_text: [{ type: "text", text: { content: v } }] };
+}
+
+function titleValue(v: string): Record<string, unknown> {
+  return { title: [{ type: "text", text: { content: v } }] };
+}
+
+function selectWithFallback(
+  sch: PropSchema,
+  v: string,
+): Record<string, unknown> | null {
+  if (sch.type === "select") {
+    const hit = sch.select?.options?.find(
+      (o) => o.name.toLowerCase() === v.toLowerCase(),
+    );
+    return { select: { name: hit?.name ?? v } };
+  }
+  if (sch.type === "status") {
+    const hit = sch.status?.options?.find(
+      (o) => o.name.toLowerCase() === v.toLowerCase(),
+    );
+    if (!hit) return null;
+    return { status: { name: hit.name } };
+  }
+  if (sch.type === "multi_select") {
+    return { multi_select: [{ name: v }] };
+  }
+  if (sch.type === "rich_text") return richTextValue(v);
+  if (sch.type === "title") return titleValue(v);
+  return null;
+}
+
+function textOrTitle(sch: PropSchema, v: string): Record<string, unknown> | null {
+  if (sch.type === "rich_text") return richTextValue(v);
+  if (sch.type === "title") return titleValue(v);
+  if (sch.type === "select") return { select: { name: v } };
+  return null;
+}
+
+/**
+ * Create a new Production task. Skips any field whose column doesn't exist
+ * or can't be coerced; always sets the Name (title).
+ */
+export async function createProductionTask(
+  cfg: BotConfig,
+  input: NewTaskInput,
+): Promise<TaskRow> {
+  if (!input.title.trim()) {
+    throw new Error("Title is required.");
+  }
+
+  const schema = (await getDatabaseSchema(cfg)).properties;
+  const props = cfg.notionProps;
+  const properties: Record<string, unknown> = {};
+
+  const titleSch = schema[props.name];
+  if (!titleSch || titleSch.type !== "title") {
+    throw new Error(
+      `No title column "${props.name}" on Production. Set NOTION_PROP_NAME.`,
+    );
+  }
+  properties[props.name] = titleValue(input.title.trim());
+
+  const assign = (name: string, val: Record<string, unknown> | null) => {
+    if (val) properties[name] = val;
+  };
+
+  if (input.client) {
+    const sch = schema[props.client];
+    if (sch) assign(props.client, textOrTitle(sch, input.client));
+  }
+  if (input.deliverable) {
+    const sch = schema[props.deliverable];
+    if (sch) assign(props.deliverable, selectWithFallback(sch, input.deliverable));
+  }
+  if (input.serviceLine) {
+    const sch = schema[props.serviceLine];
+    if (sch) assign(props.serviceLine, selectWithFallback(sch, input.serviceLine));
+  }
+  if (input.priority) {
+    const sch = schema[props.priority];
+    if (sch) assign(props.priority, selectWithFallback(sch, input.priority));
+  }
+  if (input.status) {
+    const sch = schema[props.status];
+    if (sch) assign(props.status, selectWithFallback(sch, input.status));
+  }
+  if (input.due) {
+    const sch = schema[props.due];
+    if (sch?.type === "date") {
+      properties[props.due] = { date: { start: input.due } };
+    }
+  }
+  if (input.shoot) {
+    const sch = schema[props.shoot];
+    if (sch?.type === "date") {
+      properties[props.shoot] = { date: { start: input.shoot } };
+    }
+  }
+  if (input.assignee) {
+    const sch = schema[props.assignee];
+    if (sch) {
+      if (sch.type === "rich_text") {
+        properties[props.assignee] = richTextValue(input.assignee);
+      } else if (sch.type === "title") {
+        properties[props.assignee] = titleValue(input.assignee);
+      } else if (sch.type === "select") {
+        properties[props.assignee] = { select: { name: input.assignee } };
+      }
+    }
+  }
+  if (typeof input.telegramUserId === "number") {
+    const sch = schema[props.telegramUserId];
+    if (sch) {
+      properties[props.telegramUserId] = telegramIdValueForSchema(
+        sch,
+        input.telegramUserId,
+      );
+    }
+  }
+
+  const client = new Client({ auth: cfg.notionToken });
+  const page = (await client.pages.create({
+    parent: { database_id: cfg.notionDatabaseId },
+    properties: properties as never,
+  })) as PageObjectResponse;
+  return toTaskRow(page, cfg);
+}

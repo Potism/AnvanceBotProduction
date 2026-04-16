@@ -28,6 +28,14 @@ const envRows = [
     "TELEGRAM_OPS_USER_IDS",
     "Optional; JSON array of Telegram numeric ids allowed to run /ops",
   ],
+  [
+    "TELEGRAM_SOCIAL_MANAGER_IDS",
+    "Optional; JSON array notified when someone taps \"Send to client\"",
+  ],
+  [
+    "TELEGRAM_DIGEST_TZ / _HOUR",
+    "Digest localtime gate (default Europe/Rome 08:00, DST-safe)",
+  ],
 ];
 
 export default function Home() {
@@ -190,6 +198,7 @@ export default function Home() {
                 "/overdue",
                 "/board",
                 "/find",
+                "/new",
                 "/link",
                 "/ops",
                 "/help",
@@ -204,9 +213,11 @@ export default function Home() {
             </div>
             <p className="mt-4 text-xs leading-relaxed text-zinc-500">
               Each task card has inline actions — <b>Open in Notion</b>,{" "}
-              <b>Review</b>, <b>Done</b>, <b>Snooze 1d</b>. Morning digest
-              runs weekdays at 07:00 UTC via Vercel Cron. Notion webhooks DM the
-              assignee on new tasks and hot status changes.
+              <b>Review</b>, <b>✈️ Send to client</b> (flips Client approval ={" "}
+              <i>Sent</i> and DMs social managers), <b>Done</b>, <b>Snooze 1d</b>.
+              Morning digest DMs every linked teammate at <b>08:00 Europe/Rome</b>{" "}
+              (auto-adjusts for CET/CEST). Notion webhooks DM the assignee on
+              new tasks and hot status changes.
             </p>
           </div>
 

@@ -1,10 +1,14 @@
 import { getBotConfig, isBotConfigured } from "../config";
 import { resolveTelegramAssigneeMap } from "../notion/assignee-map";
 import {
+  createProductionTask,
+  findAssigneeForTelegramId,
+  sendTaskForClientApproval,
   stampTelegramIdOnProductionForAssignee,
   snoozeTaskDue,
   updateTaskStatus,
 } from "../notion/actions";
+import { parseNewTaskArgs } from "./new-task-parse";
 import {
   loadAssigneeLinkCatalog,
   matchAssigneeInput,
@@ -18,7 +22,11 @@ import {
 } from "../notion/tasks";
 import { upsertTeamTelegramLink } from "../notion/team-link-upsert";
 import { tryHandleOpsCommand } from "./ops-commands";
-import { actionAckText } from "./notify";
+import {
+  actionAckText,
+  dmSocialManagers,
+  parseSocialManagerIds,
+} from "./notify";
 import {
   answerCallbackQuery,
   editMessageTextHtml,
@@ -286,6 +294,13 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     return;
   }
 
+  const newMatch = text.match(/^\/new(?:@\S*)?(?:\s+([\s\S]*))?$/i);
+  if (newMatch) {
+    const args = (newMatch[1] ?? "").trim();
+    await handleNewCommand(cfg, chatId, fromId, args);
+    return;
+  }
+
   if (await tryHandleOpsCommand(cfg, token, chatId, fromId, text)) {
     return;
   }
@@ -351,6 +366,19 @@ async function handleTaskActionCallback(
     } else if (action === "snz") {
       updated = await snoozeTaskDue(cfg, pageId, 1);
       ackLabel = "Snoozed 1 day";
+    } else if (action === "cappr") {
+      updated = await sendTaskForClientApproval(cfg, pageId);
+      ackLabel = "Sent to client for approval";
+      if (updated) {
+        const managerCount = parseSocialManagerIds().length;
+        if (managerCount > 0) {
+          await dmSocialManagers(
+            cfg,
+            "Client approval requested",
+            updated,
+          ).catch(() => {});
+        }
+      }
     } else {
       await sendMessageHtml(token, chatId, "Unknown action.");
       return;
@@ -380,6 +408,88 @@ async function handleTaskActionCallback(
   }
   // fromId reserved for future per-user permission checks on actions
   void fromId;
+}
+
+async function handleNewCommand(
+  cfg: BotConfig,
+  chatId: number,
+  fromId: number,
+  raw: string,
+): Promise<void> {
+  const token = cfg.telegramBotToken;
+  if (!raw.trim()) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Quick task creation</b>
+
+<code>/new &lt;title&gt; [· client:X] [· deliv:Y] [· due:Fri] [· priority:P1]</code>
+
+<b>Examples</b>
+<code>/new APX Reels pack · due:Fri · priority:P1</code>
+<code>/new Hotel Orologio photo · client:hotel · deliv:Photo deliverable pack · due:tomorrow · shoot:+3d</code>
+<code>/new Corso edit · due:2026-04-28 · assign:Albert</code>
+
+<b>Dates</b> — ISO, <code>today</code>, <code>tomorrow</code>, <code>+2d</code>, <code>+1w</code>, or a weekday (<code>Fri</code>).
+<b>Default assignee</b> — you (your Telegram id is stamped so it shows in /mine).`,
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+
+  const parsed = parseNewTaskArgs(raw);
+  if (!parsed.title) {
+    await sendMessageHtml(
+      token,
+      chatId,
+      "<b>Need a title</b>\nUsage: <code>/new Title here · due:Fri</code>",
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+
+  if (!parsed.assignee) {
+    const myAssignee = await findAssigneeForTelegramId(cfg, fromId).catch(
+      () => null,
+    );
+    if (myAssignee) parsed.assignee = myAssignee;
+  }
+
+  try {
+    const row = await createProductionTask(cfg, {
+      title: parsed.title,
+      client: parsed.client,
+      deliverable: parsed.deliverable,
+      serviceLine: parsed.serviceLine,
+      priority: parsed.priority,
+      status: parsed.status,
+      due: parsed.due,
+      shoot: parsed.shoot,
+      assignee: parsed.assignee,
+      telegramUserId: fromId,
+    });
+
+    const unknownNote =
+      parsed.unknown.length > 0
+        ? `\n\n<i>Ignored tokens:</i> <code>${esc(parsed.unknown.join(" · "))}</code>`
+        : "";
+
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Task created</b>${unknownNote}\n\n${formatTaskCard(row)}`,
+      taskActionKeyboard(row.id, row.url),
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[new]", e);
+    await sendMessageHtml(
+      token,
+      chatId,
+      `<b>Could not create</b>\n<code>${esc(msg)}</code>`,
+      mainMenuKeyboard(),
+    );
+  }
 }
 
 async function handleFindCommand(
@@ -443,7 +553,7 @@ function welcomeMessage(
     ? "You're linked for <b>My queue</b>."
     : "Tap <b>🔗 Link account</b> or run <code>/link Your Name</code> to see your queue instantly.";
   void notionTeamDir;
-  return `<b>Anvance Production</b>\n<i>Telegram · Notion task desk</i>\n\n${linkHint}\n\n<b>Do it fast</b>\n• <code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code>\n• <code>/find hotel</code> — search any task\n• Tap a task card to <b>Review</b>, <b>Done</b>, or <b>Snooze</b>.`;
+  return `<b>Anvance Production</b>\n<i>Telegram · Notion task desk</i>\n\n${linkHint}\n\n<b>Do it fast</b>\n• <code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code>\n• <code>/new Title · due:Fri · client:X</code> — create a task from chat\n• <code>/find hotel</code> — search any task\n• Tap a card to <b>Review</b>, <b>Send to client</b>, <b>Done</b>, or <b>Snooze</b>.`;
 }
 
 function helpMessage(
@@ -455,7 +565,7 @@ function helpMessage(
     Object.keys(map).length === 0
       ? "No assignee links loaded (using Production's Telegram id column directly)."
       : `Assignee links on file: <b>${Object.keys(map).length}</b>`;
-  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code> · <code>/board</code>\n<code>/find &lt;keyword&gt;</code> — search tasks\n<code>/link Your Name</code> — stamp Telegram id on your Production rows\n<code>/start</code> · <code>/help</code>\n\n<b>On a task card</b>\n• 🔗 Open in Notion\n• 🔍 Review → Internal review\n• ✅ Done → Approved\n• ⏰ Snooze 1d → bumps Due\n\n<b>Ops</b> (managers, if enabled): <code>/ops help</code>\n\n<b>Natural language</b>\n<i>what are my tasks today</i> · <i>this week</i> · <i>team board</i> · <i>overdue</i>`;
+  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code> · <code>/board</code>\n<code>/find &lt;keyword&gt;</code> — search tasks\n<code>/new &lt;title&gt; · due:Fri · client:X</code> — quick create\n<code>/link Your Name</code> — stamp Telegram id on your Production rows\n<code>/start</code> · <code>/help</code>\n\n<b>On a task card</b>\n• 🔗 Open in Notion\n• 🔍 Review → Internal review\n• ✈️ Send to client → Client approval = Sent + DM social manager\n• ✅ Done → Approved\n• ⏰ Snooze 1d → bumps Due\n\n<b>Ops</b> (managers, if enabled): <code>/ops help</code>\n\n<b>Natural language</b>\n<i>what are my tasks today</i> · <i>this week</i> · <i>team board</i> · <i>overdue</i>`;
 }
 
 function esc(s: string): string {
