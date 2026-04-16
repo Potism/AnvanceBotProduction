@@ -46,11 +46,18 @@ export async function POST(req: NextRequest) {
   }
 
   if (isVerificationOnlyPayload(parsed)) {
+    const { verification_token } = parsed;
     console.info(
-      "[notion webhook] Paste this verification_token in Notion → Webhooks → Verify:",
-      parsed.verification_token,
+      "[notion webhook] Paste verification_token in Notion → Webhooks → Verify:",
+      verification_token,
     );
-    return Response.json({ ok: true });
+    // Same value Notion sent in the request body; echoed so it can appear under
+    // this invocation’s Response in Vercel when request logs omit console output.
+    return Response.json({
+      ok: true,
+      verification_token,
+      hint: "Copy verification_token into Notion’s Verify subscription dialog.",
+    });
   }
 
   const token = process.env.NOTION_WEBHOOK_VERIFICATION_TOKEN;
