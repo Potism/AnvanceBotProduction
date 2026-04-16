@@ -11,13 +11,50 @@ export async function GET(req: NextRequest) {
 
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const base = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "");
-  const whSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const whSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
+  const reset = req.nextUrl.searchParams.get("reset") === "1";
 
   if (!token || !base) {
     return Response.json(
       { ok: false, error: "TELEGRAM_BOT_TOKEN and NEXT_PUBLIC_APP_URL required" },
       { status: 400 },
     );
+  }
+
+  if (whSecret && whSecret.length > 256) {
+    return Response.json(
+      {
+        ok: false,
+        error: "TELEGRAM_WEBHOOK_SECRET must be at most 256 characters for Telegram secret_token",
+      },
+      { status: 400 },
+    );
+  }
+
+  if (reset) {
+    const del = await fetch(
+      `https://api.telegram.org/bot${token}/deleteWebhook`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ drop_pending_updates: true }),
+      },
+    );
+    const delBody = (await del.json().catch(() => ({}))) as {
+      ok?: boolean;
+      description?: string;
+    };
+    if (delBody.ok !== true) {
+      return Response.json(
+        {
+          ok: false,
+          step: "deleteWebhook",
+          telegram: delBody,
+          hint: delBody.description ?? "deleteWebhook failed",
+        },
+        { status: 502 },
+      );
+    }
   }
 
   const url = `${base}/api/telegram/webhook`;
@@ -30,6 +67,7 @@ export async function GET(req: NextRequest) {
         url,
         secret_token: whSecret || undefined,
         allowed_updates: ["message", "callback_query"],
+        drop_pending_updates: reset ? true : undefined,
       }),
     },
   );
@@ -49,6 +87,7 @@ export async function GET(req: NextRequest) {
       httpStatus: res.status,
       telegram: body,
       webhookUrl: url,
+      resetUsed: reset,
       hint: telegramAccepted
         ? "Webhook registered. Re-check GET /api/telegram/status?secret=…"
         : body.description ??
