@@ -4,19 +4,58 @@
  * Enabled whenever OPENAI_API_KEY is present.
  */
 
-const CHAT_URL = "https://api.openai.com/v1/chat/completions";
-const AUDIO_URL = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_DIRECT = "https://api.openai.com/v1";
+const VERCEL_GATEWAY = "https://ai-gateway.vercel.sh/v1";
 
 const CHAT_TIMEOUT_MS = 30_000;
 const AUDIO_TIMEOUT_MS = 120_000;
 const MAX_AUDIO_BYTES = 24 * 1024 * 1024;
 
-export function aiEnabled(): boolean {
-  return Boolean(process.env.OPENAI_API_KEY?.trim());
+function apiKey(): string {
+  return process.env.OPENAI_API_KEY?.trim() ?? "";
 }
 
+function isGatewayKey(key: string): boolean {
+  return key.startsWith("vck_") || key.startsWith("ai_");
+}
+
+/** Base URL for chat completions. Auto-routes Vercel Gateway keys. */
+function chatBaseUrl(): string {
+  const explicit = process.env.OPENAI_BASE_URL?.trim();
+  if (explicit) return explicit.replace(/\/$/, "");
+  return isGatewayKey(apiKey()) ? VERCEL_GATEWAY : OPENAI_DIRECT;
+}
+
+/** Audio base URL — Whisper is NOT served via Vercel AI Gateway (yet),
+ *  so gateway keys are not used for audio. An explicit override wins. */
+function audioBaseUrl(): string {
+  const explicit =
+    process.env.OPENAI_AUDIO_BASE_URL?.trim() ||
+    process.env.OPENAI_BASE_URL?.trim();
+  if (explicit) return explicit.replace(/\/$/, "");
+  return OPENAI_DIRECT;
+}
+
+function audioKey(): string {
+  return (
+    process.env.OPENAI_AUDIO_KEY?.trim() ||
+    (isGatewayKey(apiKey()) ? "" : apiKey())
+  );
+}
+
+export function aiEnabled(): boolean {
+  return Boolean(apiKey());
+}
+
+export function voiceEnabled(): boolean {
+  return Boolean(audioKey());
+}
+
+/** Chat model. On Vercel Gateway, prefer provider-prefixed slug (openai/…). */
 function chatModel(): string {
-  return process.env.OPENAI_MODEL?.trim() || "gpt-5.4";
+  const m = process.env.OPENAI_MODEL?.trim();
+  if (m) return m;
+  return isGatewayKey(apiKey()) ? "openai/gpt-5.4" : "gpt-5.4";
 }
 
 function audioModel(): string {
@@ -49,7 +88,11 @@ export async function transcribeAudio(
   audio: ArrayBuffer,
   filename: string,
 ): Promise<string> {
-  if (!aiEnabled()) throw new Error("OPENAI_API_KEY not set");
+  if (!voiceEnabled()) {
+    throw new Error(
+      "Voice transcription needs a raw OpenAI key. Your OPENAI_API_KEY looks like a Vercel AI Gateway token (vck_…), which currently doesn't expose Whisper. Add OPENAI_AUDIO_KEY=sk-... (or set OPENAI_API_KEY directly to an sk- key).",
+    );
+  }
   if (audio.byteLength > MAX_AUDIO_BYTES) {
     throw new Error("Audio too large (max 24MB).");
   }
@@ -60,9 +103,10 @@ export async function transcribeAudio(
   form.append("response_format", "json");
   form.append("temperature", "0");
 
-  const res = await timedFetch(AUDIO_URL, {
+  const url = `${audioBaseUrl()}/audio/transcriptions`;
+  const res = await timedFetch(url, {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    headers: { Authorization: `Bearer ${audioKey()}` },
     body: form,
     timeoutMs: AUDIO_TIMEOUT_MS,
   });
@@ -98,11 +142,11 @@ async function chatJson<T>(
     },
   };
 
-  const res = await timedFetch(CHAT_URL, {
+  const res = await timedFetch(`${chatBaseUrl()}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey()}`,
     },
     body: JSON.stringify(body),
   });

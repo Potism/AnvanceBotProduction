@@ -117,9 +117,10 @@ export function mainMenuKeyboard(): ReplyMarkup {
         { text: "🔎 Find", callback_data: "a:find" },
       ],
       [
+        { text: "➕ New task", callback_data: "n:start" },
         { text: "🔗 Link account", callback_data: "a:link" },
-        { text: "❔ Help", callback_data: "v:help" },
       ],
+      [{ text: "❔ Help", callback_data: "v:help" }],
     ],
   };
 }

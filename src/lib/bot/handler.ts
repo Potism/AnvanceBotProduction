@@ -33,6 +33,13 @@ import {
 import { upsertTeamTelegramLink } from "../notion/team-link-upsert";
 import { tryHandleOpsCommand } from "./ops-commands";
 import {
+  cancelWizard,
+  handleWizardCallback,
+  handleWizardText,
+  hasActiveWizard,
+  startWizard,
+} from "./wizard";
+import {
   actionAckText,
   dmSocialManagers,
   parseSocialManagerIds,
@@ -246,6 +253,18 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
       return;
     }
 
+    if (data.startsWith("n:")) {
+      await handleWizardCallback(
+        cfg,
+        fromId,
+        chatId,
+        messageId,
+        u.callback_query.id,
+        data,
+      );
+      return;
+    }
+
     if (data.startsWith("t:")) {
       await handleTaskActionCallback(
         cfg,
@@ -289,6 +308,22 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
     text = spoken;
   }
 
+  if (hasActiveWizard(fromId) && !text.startsWith("/")) {
+    const consumed = await handleWizardText(cfg, fromId, text);
+    if (consumed) return;
+  }
+
+  if (text.startsWith("/cancel")) {
+    const had = cancelWizard(fromId);
+    await sendMessageHtml(
+      token,
+      chatId,
+      had ? "<i>New task cancelled.</i>" : "<i>Nothing to cancel.</i>",
+      mainMenuKeyboard(),
+    );
+    return;
+  }
+
   if (text.startsWith("/start")) {
     await sendMessageHtml(
       token,
@@ -326,6 +361,10 @@ export async function handleTelegramUpdate(update: unknown): Promise<void> {
   const newMatch = text.match(/^\/new(?:@\S*)?(?:\s+([\s\S]*))?$/i);
   if (newMatch) {
     const args = (newMatch[1] ?? "").trim();
+    if (!args) {
+      await startWizard(cfg, chatId, fromId);
+      return;
+    }
     await handleNewCommand(cfg, chatId, fromId, args);
     return;
   }
@@ -754,7 +793,7 @@ function welcomeMessage(
     ? "You're linked for <b>My queue</b>."
     : "Tap <b>🔗 Link account</b> or run <code>/link Your Name</code> to see your queue instantly.";
   void notionTeamDir;
-  return `<b>Anvance Production</b>\n<i>Telegram · Notion task desk</i>\n\n${linkHint}\n\n<b>Do it fast</b>\n• <code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code>\n• <code>/new Title · due:Fri · client:X</code> — create a task from chat\n• <code>/find hotel</code> — search any task\n• Tap a card to <b>Review</b>, <b>Send to client</b>, <b>Done</b>, or <b>Snooze</b>.`;
+  return `<b>Anvance Production</b>\n<i>Telegram · Notion task desk</i>\n\n${linkHint}\n\n<b>Do it fast</b>\n• <code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code>\n• Tap <b>➕ New task</b> — guided step-by-step, no syntax needed\n• Or <code>/new Title · due:Fri · client:X</code> for power users\n• <code>/find hotel</code> — search any task\n• Tap a card to <b>Review</b>, <b>Send to client</b>, <b>Done</b>, or <b>Snooze</b>.`;
 }
 
 function helpMessage(
@@ -766,7 +805,7 @@ function helpMessage(
     Object.keys(map).length === 0
       ? "No assignee links loaded (using Production's Telegram id column directly)."
       : `Assignee links on file: <b>${Object.keys(map).length}</b>`;
-  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code> · <code>/board</code>\n<code>/find &lt;keyword&gt;</code> — search tasks\n<code>/new &lt;title&gt; · due:Fri · client:X</code> — quick create\n<code>/link Your Name</code> — stamp Telegram id on your Production rows\n<code>/start</code> · <code>/help</code>\n\n<b>On a task card</b>\n• 🔗 Open in Notion\n• 🔍 Review → Internal review\n• ✈️ Send to client → Client approval = Sent + DM social manager\n• ✅ Done → Approved\n• ⏰ Snooze 1d → bumps Due\n\n<b>Ops</b> (managers, if enabled): <code>/ops help</code>\n\n<b>Natural language</b>\n<i>what are my tasks today</i> · <i>this week</i> · <i>team board</i> · <i>overdue</i>`;
+  return `${idLine}\n${mapLine}\n\n<b>Commands</b>\n<code>/today</code> · <code>/week</code> · <code>/mine</code> · <code>/overdue</code> · <code>/board</code>\n<code>/find &lt;keyword&gt;</code> — search tasks\n<code>/new</code> — <b>guided wizard</b> (title → client → deliverable → due → priority → shoot)\n<code>/new &lt;title&gt; · due:Fri</code> — one-shot create for power users\n<code>/cancel</code> — abort an in-progress new task\n<code>/link Your Name</code> — stamp Telegram id on your Production rows\n<code>/start</code> · <code>/help</code>\n\n<b>On a task card</b>\n• 🔗 Open in Notion\n• 🔍 Review → Internal review\n• ✈️ Send to client → Client approval = Sent + DM social manager\n• ✅ Done → Approved\n• ⏰ Snooze 1d → bumps Due\n\n<b>Ops</b> (managers, if enabled): <code>/ops help</code>\n\n<b>Natural language</b>\n<i>what are my tasks today</i> · <i>this week</i> · <i>team board</i> · <i>overdue</i>`;
 }
 
 function esc(s: string): string {
