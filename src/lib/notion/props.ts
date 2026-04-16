@@ -58,6 +58,21 @@ export function propertyAsLines(
   }
 }
 
+/** People-type assignee: partial user refs (for email enrichment on /link). */
+export function propertyPeopleRefs(
+  page: PageObjectResponse,
+  propName: string,
+): { id: string; name: string }[] {
+  const p = page.properties[propName];
+  if (!p || p.type !== "people") return [];
+  return p.people
+    .filter((u) => "id" in u && typeof u.id === "string")
+    .map((u) => ({
+      id: u.id,
+      name: "name" in u && typeof u.name === "string" ? u.name : "",
+    }));
+}
+
 export function propertyAsString(
   page: PageObjectResponse,
   propName: string,

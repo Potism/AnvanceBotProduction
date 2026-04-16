@@ -58,11 +58,11 @@ function matchesAssignee(row: TaskRow, needle: string | undefined): boolean {
   return hay.includes(h) || h.includes(hay);
 }
 
-export async function fetchProductionTasks(
+/** Raw pages from Production for a view (before assignee / status filters on rows). */
+export async function fetchProductionPages(
   cfg: BotConfig,
   view: TaskView,
-  assigneeNeedle: string | undefined,
-): Promise<TaskRow[]> {
+): Promise<PageObjectResponse[]> {
   const client = new Client({ auth: cfg.notionToken });
   const today = startOfDay(new Date());
   const weekEnd = addDaysISO(today, 7);
@@ -116,6 +116,16 @@ export async function fetchProductionTasks(
     }
     cursor = res.has_more ? res.next_cursor ?? undefined : undefined;
   } while (cursor);
+
+  return responses;
+}
+
+export async function fetchProductionTasks(
+  cfg: BotConfig,
+  view: TaskView,
+  assigneeNeedle: string | undefined,
+): Promise<TaskRow[]> {
+  const responses = await fetchProductionPages(cfg, view);
 
   let rows = responses.map((p) => toRow(p, cfg));
 

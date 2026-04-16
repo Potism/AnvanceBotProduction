@@ -1,7 +1,7 @@
 import { getBotConfig, isBotConfigured } from "../config";
 import { resolveTelegramAssigneeMap } from "../notion/assignee-map";
 import {
-  listDistinctAssigneesFromProduction,
+  loadAssigneeLinkCatalog,
   matchAssigneeInput,
 } from "../notion/production-assignees";
 import { upsertTeamTelegramLink } from "../notion/team-link-upsert";
@@ -267,7 +267,7 @@ function welcomeMessage(
   const linkHint = linked
     ? "You are set up for <b>My queue</b>."
     : notionTeamDir
-      ? `Tap <b>Link account</b> or send <code>/link Your Notion name</code> (same spelling as <b>Assignee</b> in Production).`
+      ? `Tap <b>Link account</b> or <code>/link</code> with your <b>Assignee</b> name or workspace <b>email</b> (see /help).`
       : `For <b>My queue</b>, ops can enable the team link database or add you via <code>TELEGRAM_USER_ASSIGNEE_MAP</code> in Vercel.`;
   return `<b>Anvance Production</b>\n<i>Notion task desk</i>\n\n${linkHint}\n\nUse the keyboard or type naturally — e.g. <i>tasks due today</i>.`;
 }
@@ -308,14 +308,15 @@ function esc(s: string): string {
 function linkInstructionsHtml(): string {
   return `<b>Link your Telegram account</b>
 
-So <b>My queue</b> can show <i>your</i> Production tasks, send your name exactly as it appears in the <b>Assignee</b> column:
+For <b>My queue</b>, send either:
 
-<code>/link Your full name</code>
+• <b>Name</b> — as shown on tasks (text assignee, or each person’s name when Assignee is <b>People</b>)
+• <b>Work email</b> — same email Notion has for you in the workspace (if the integration can read it)
 
-<b>Example</b>
 <code>/link Albert Rhey Embalsado</code>
+<code>/link you@company.com</code>
 
-We match against assignee names currently on tasks in Production. If several people match, use a fuller name.`;
+We match open Production tasks. If several names match, use a fuller name.`;
 }
 
 function linkDisabledNoDbHtml(): string {
@@ -356,11 +357,16 @@ ${lines}`;
   return linkInstructionsHtml();
 }
 
-function linkSuccessHtml(assignee: string, mode: "exact" | "unique_partial"): string {
+function linkSuccessHtml(
+  assignee: string,
+  mode: "exact" | "unique_partial" | "email",
+): string {
   const note =
     mode === "unique_partial"
       ? "\n<i>Matched from a partial name — you can re-link with the full name anytime.</i>"
-      : "";
+      : mode === "email"
+        ? "\n<i>Matched by workspace email from Notion.</i>"
+        : "";
   return `<b>Linked</b>
 
 Your Telegram is mapped to:
@@ -400,8 +406,8 @@ async function handleLinkCommand(
     return;
   }
   try {
-    const candidates = await listDistinctAssigneesFromProduction(cfg);
-    if (candidates.length === 0) {
+    const catalog = await loadAssigneeLinkCatalog(cfg);
+    if (catalog.displayNames.length === 0) {
       await sendMessageHtml(
         token,
         chatId,
@@ -410,7 +416,7 @@ async function handleLinkCommand(
       );
       return;
     }
-    const match = matchAssigneeInput(nameArg, candidates);
+    const match = matchAssigneeInput(nameArg, catalog);
     if (!match.ok) {
       await sendMessageHtml(
         token,

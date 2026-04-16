@@ -1,27 +1,75 @@
+import { Client } from "@notionhq/client";
+import type { UserObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 import type { BotConfig } from "../types";
-import { fetchProductionTasks } from "./tasks";
+import { propertyAsString, propertyPeopleRefs } from "./props";
+import { fetchProductionPages } from "./tasks";
 
-/** Distinct non-empty Assignee strings from Production (board view, full window). */
-export async function listDistinctAssigneesFromProduction(
+export type AssigneeLinkCatalog = {
+  /** Display strings from task rows (text, People names joined, etc.) */
+  displayNames: string[];
+  /** Lowercased workspace email → display name for /mine (from Notion Users API) */
+  emailToDisplay: Record<string, string>;
+};
+
+function personEmailFromUser(u: UserObjectResponse): string | null {
+  if (u.type !== "person" || !("person" in u) || !u.person) return null;
+  const pe = u.person as { email?: string };
+  if (typeof pe.email !== "string" || !pe.email.includes("@")) return null;
+  return pe.email.trim().toLowerCase();
+}
+
+/**
+ * Names (and optional workspace emails) that can be used with /link for People-type Assignee.
+ */
+export async function loadAssigneeLinkCatalog(
   cfg: BotConfig,
-): Promise<string[]> {
-  const rows = await fetchProductionTasks(cfg, "board", undefined);
-  const set = new Set<string>();
-  for (const r of rows) {
-    const a = r.assignee.trim();
-    if (a) set.add(a);
+): Promise<AssigneeLinkCatalog> {
+  const pages = await fetchProductionPages(cfg, "board");
+  const assigneeProp = cfg.notionProps.assignee;
+  const displayNames = new Set<string>();
+  const userIds = new Set<string>();
+
+  for (const page of pages) {
+    const s = propertyAsString(page, assigneeProp).trim();
+    if (s) displayNames.add(s);
+    for (const { id } of propertyPeopleRefs(page, assigneeProp)) {
+      userIds.add(id);
+    }
   }
-  return [...set].sort((a, b) => a.localeCompare(b));
+
+  const emailToDisplay: Record<string, string> = {};
+  const client = new Client({ auth: cfg.notionToken });
+
+  for (const uid of userIds) {
+    try {
+      const u = (await client.users.retrieve({
+        user_id: uid,
+      })) as UserObjectResponse;
+      const email = personEmailFromUser(u);
+      const display =
+        "name" in u && typeof u.name === "string" && u.name.trim()
+          ? u.name.trim()
+          : "";
+      if (email && display) {
+        emailToDisplay[email] = display;
+        displayNames.add(display);
+      }
+    } catch {
+      /* bot, removed user, or no access */
+    }
+  }
+
+  return {
+    displayNames: [...displayNames].sort((a, b) => a.localeCompare(b)),
+    emailToDisplay,
+  };
 }
 
 export type AssigneeMatchResult =
-  | { ok: true; assignee: string; mode: "exact" | "unique_partial" }
+  | { ok: true; assignee: string; mode: "exact" | "unique_partial" | "email" }
   | { ok: false; reason: "empty" | "none" | "ambiguous"; suggestions: string[] };
 
-/**
- * Map free-text input to a canonical Production assignee string.
- */
-export function matchAssigneeInput(
+function matchOnDisplayNames(
   raw: string,
   candidates: readonly string[],
 ): AssigneeMatchResult {
@@ -55,4 +103,28 @@ export function matchAssigneeInput(
     reason: "none",
     suggestions: [...candidates].slice(0, 15),
   };
+}
+
+/**
+ * Map /link input to the assignee string used for My queue (matches People names on tasks).
+ */
+export function matchAssigneeInput(
+  raw: string,
+  catalog: AssigneeLinkCatalog,
+): AssigneeMatchResult {
+  const t = raw.trim();
+  if (!t) return { ok: false, reason: "empty", suggestions: [] };
+
+  if (t.includes("@")) {
+    const key = t.toLowerCase();
+    if (catalog.emailToDisplay[key]) {
+      return {
+        ok: true,
+        assignee: catalog.emailToDisplay[key],
+        mode: "email",
+      };
+    }
+  }
+
+  return matchOnDisplayNames(t, catalog.displayNames);
 }
